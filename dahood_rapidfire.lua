@@ -1626,20 +1626,6 @@ triggerBox:AddToggle("TriggerUseFOV", {
     Tooltip = "Also require the target to be within the FOV radius, on top of the mouse-over check.",
 })
 
-local manipBox = Tabs.Combat:AddRightGroupbox("Manipulation")
-
-manipBox:AddToggle("BulletManipulation", {
-    Text = "Bullet Manipulation",
-    Default = false,
-    Tooltip = "Overrides the client-side hit part / normal so the server's hit-registration payload always describes a hit on the aimed part. Bullets connect through walls and around corners. Requires Silent Aim on.",
-})
-
-manipBox:AddToggle("MagicBullet", {
-    Text = "Magic Bullet",
-    Default = false,
-    Tooltip = "When Bullet Manipulation is on, force the reported hit part to the target's Head for max damage — overrides the Silent Aim part choice.",
-})
-
 local fovBox = Tabs.Combat:AddLeftGroupbox("FOV Circle")
 
 fovBox:AddToggle("ShowFOV", {
@@ -1850,7 +1836,7 @@ end)
 -- Version sentinel so live-diagnostic probes can confirm this exact revision
 -- of the hook is installed (bump the string on every semantic change to the
 -- shoot hook, ragebot gating logic, or magic-bullet payload).
-_G.pengooin_HookVersion = "2026-09-24-combat-overhaul"
+_G.pengooin_HookVersion = "2026-09-24-no-wall-bypass-manual"
 
 -- Shared shoot hook. Two independent aim-override paths:
 --   1. Ragebot (highest priority when its toggle is on) — always magic-bullets
@@ -1884,6 +1870,12 @@ do
                     end
                 end
             elseif Toggles.SilentAim and Toggles.SilentAim.Value then
+                -- Combat-tab Silent Aim: override AimPosition ONLY. Do NOT set
+                -- args.Hit / args.Normal — that path triggered a permaban when
+                -- combined with rapidfire (server-side detected headshots
+                -- through walls at unnatural angles). Leaving the raycast to
+                -- run naturally means bullets only land when line of sight
+                -- exists, which matches human aim well enough.
                 local useFOV = Toggles.SilentAimUseFOV and Toggles.SilentAimUseFOV.Value
                 local fov = Options.FOVSize and Options.FOVSize.Value or 120
                 local t = pickClosestEnemy(useFOV, fov)
@@ -1892,23 +1884,6 @@ do
                     if part then
                         local aim = part.Position + part.AssemblyLinearVelocity * 0.03
                         args.AimPosition = aim
-
-                        if Toggles.BulletManipulation and Toggles.BulletManipulation.Value then
-                            local hitPart = part
-                            if Toggles.MagicBullet and Toggles.MagicBullet.Value then
-                                local head = t.Character:FindFirstChild("Head")
-                                if head then
-                                    hitPart = head
-                                    aim = head.Position + head.AssemblyLinearVelocity * 0.03
-                                    args.AimPosition = aim
-                                end
-                            end
-                            args.Hit = hitPart
-                            args.Normal = (args.ForcedOrigin and (args.ForcedOrigin - aim).Magnitude > 0)
-                                and (args.ForcedOrigin - aim).Unit
-                                or Vector3.new(0, 1, 0)
-                        end
-
                         if args.ForcedOrigin and args.Range then
                             local dist = (aim - args.ForcedOrigin).Magnitude
                             if dist > args.Range then args.Range = dist + 25 end
