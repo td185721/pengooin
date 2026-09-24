@@ -52,6 +52,11 @@ local state = {
         active = false,
         thread = nil,
     },
+    combat = {
+        aimbot = {conn = nil, keyHeld = false},
+        triggerbot = {conn = nil, lastFireAt = 0, keyHeld = false},
+        fov = {conn = nil, sgui = nil, ring = nil},
+    },
 }
 
 local function clearConns()
@@ -248,6 +253,7 @@ local Window = Library:CreateWindow({
 })
 
 local Tabs = {
+    Combat = Window:AddTab("Combat"),
     Movement = Window:AddTab("Movement"),
     Buy = Window:AddTab("Buy"),
     Ragebot = Window:AddTab("Ragebot"),
@@ -1410,6 +1416,427 @@ Toggles.AutoBuyArmor:OnChanged(function()
     if Toggles.AutoBuyArmor.Value then startAutoArmor() else stopAutoArmor() end
 end)
 
+-- ── Combat Tab ────────────────────────────────────────────────────────────
+-- Silent aim / aimbot / triggerbot / bullet manipulation / magic bullet.
+-- Client-side targeting only (part resolvers, closest-to-mouse selection,
+-- FOV circle). All server-facing overrides happen in the shared GunHandler
+-- .shoot hook below — one code path so ragebot and silent-aim stack cleanly.
+
+local PART_CHOICES = {
+    "Head", "UpperTorso", "HumanoidRootPart", "LowerTorso",
+    "Random Part", "Closest to Mouse",
+}
+
+local RANDOM_PARTS = {
+    "Head", "UpperTorso", "LowerTorso", "HumanoidRootPart",
+    "RightUpperArm", "LeftUpperArm", "RightHand", "LeftHand",
+    "RightUpperLeg", "LeftUpperLeg", "RightFoot", "LeftFoot",
+}
+
+local function firstExisting(char, names)
+    for _, n in names do
+        local p = char:FindFirstChild(n)
+        if p and p:IsA("BasePart") then return p end
+    end
+    return nil
+end
+
+local function partScreenDist(part, mx, my)
+    if not part or not part:IsA("BasePart") then return math.huge end
+    local sp, on = camera:WorldToScreenPoint(part.Position)
+    if not on or sp.Z <= 0 then return math.huge end
+    local dx, dy = sp.X - mx, sp.Y - my
+    return math.sqrt(dx * dx + dy * dy)
+end
+
+local function resolvePart(char, choice)
+    if not char then return nil end
+    if choice == "Head" then
+        return char:FindFirstChild("Head")
+    elseif choice == "UpperTorso" then
+        return firstExisting(char, {"UpperTorso", "Torso"})
+    elseif choice == "HumanoidRootPart" then
+        return char:FindFirstChild("HumanoidRootPart")
+    elseif choice == "LowerTorso" then
+        return firstExisting(char, {"LowerTorso", "HumanoidRootPart", "UpperTorso"})
+    elseif choice == "Random Part" then
+        for _ = 1, 5 do
+            local n = RANDOM_PARTS[math.random(1, #RANDOM_PARTS)]
+            local p = char:FindFirstChild(n)
+            if p and p:IsA("BasePart") then return p end
+        end
+        return char:FindFirstChild("HumanoidRootPart")
+    elseif choice == "Closest to Mouse" then
+        local m = lp:GetMouse()
+        local best, bestD = nil, math.huge
+        for _, p in char:GetChildren() do
+            if p:IsA("BasePart") then
+                local d = partScreenDist(p, m.X, m.Y)
+                if d < bestD then best, bestD = p, d end
+            end
+        end
+        return best or char:FindFirstChild("HumanoidRootPart")
+    end
+    return char:FindFirstChild("HumanoidRootPart")
+end
+
+local function isValidEnemy(p)
+    if not p or p == lp then return false end
+    local c = p.Character
+    if not c then return false end
+    local h = c:FindFirstChildOfClass("Humanoid")
+    if not h or h.Health <= 0 then return false end
+    if targetProtected(p) then return false end
+    if targetDowned(p) then return false end
+    -- Also gate on the same Dead/SDeath signal used elsewhere so corpses
+    -- never get counted as valid enemies.
+    local be = c:FindFirstChild("BodyEffects")
+    if be then
+        local dead = be:FindFirstChild("Dead")
+        if dead and dead.Value then return false end
+        local sdeath = be:FindFirstChild("SDeath")
+        if sdeath and sdeath.Value then return false end
+    end
+    return true
+end
+
+-- Find the enemy whose Head (or HRP fallback) is closest to the mouse cursor
+-- in screen space. When useFOV is true, exclude anyone whose screen distance
+-- exceeds fovRadius pixels. Shared by silent aim, aimbot, and triggerbot FOV.
+local function pickClosestEnemy(useFOV, fovRadius)
+    local m = lp:GetMouse()
+    local mx, my = m.X, m.Y
+    local best, bestD = nil, math.huge
+    for _, p in Players:GetPlayers() do
+        if isValidEnemy(p) then
+            local head = p.Character:FindFirstChild("Head") or p.Character:FindFirstChild("HumanoidRootPart")
+            if head then
+                local sp, on = camera:WorldToScreenPoint(head.Position)
+                if on and sp.Z > 0 then
+                    local dx, dy = sp.X - mx, sp.Y - my
+                    local d = math.sqrt(dx * dx + dy * dy)
+                    if (not useFOV or d <= fovRadius) and d < bestD then
+                        best, bestD = p, d
+                    end
+                end
+            end
+        end
+    end
+    return best
+end
+
+-- Combat UI ───────────────────────────────────────────────────────────────
+
+local silentBox = Tabs.Combat:AddLeftGroupbox("Silent Aim")
+
+silentBox:AddToggle("SilentAim", {
+    Text = "Silent Aim",
+    Default = false,
+    Tooltip = "Rewrites the aim vector inside GunHandler.shoot to the chosen part on the closest enemy before the ShootGun RPC leaves. Server sees a legitimate aim toward the target.",
+}):AddKeyPicker("SilentAimKey", {
+    Default = "None",
+    SyncToggleState = true,
+    Mode = "Toggle",
+    Text = "Silent Aim",
+})
+
+silentBox:AddDropdown("SilentAimPart", {
+    Values = PART_CHOICES,
+    Default = "Head",
+    Text = "Target Part",
+    Tooltip = "Head = max damage. Random Part varies per shot. Closest to Mouse picks whichever limb sits nearest the cursor for each individual shot.",
+})
+
+silentBox:AddToggle("SilentAimUseFOV", {
+    Text = "Use FOV",
+    Default = false,
+    Tooltip = "Only redirect bullets when the closest enemy is within the FOV radius. Off = every shot locks on regardless of aim direction.",
+})
+
+local aimboxBox = Tabs.Combat:AddRightGroupbox("Aimbot")
+
+aimboxBox:AddToggle("Aimbot", {
+    Text = "Aimbot",
+    Default = false,
+    Tooltip = "Rotate the camera to look at the closest enemy's chosen part while the aim key is held.",
+}):AddKeyPicker("AimbotKey", {
+    Default = "MB2",
+    SyncToggleState = false,
+    Mode = "Hold",
+    Text = "Aimbot",
+})
+
+aimboxBox:AddDropdown("AimbotPart", {
+    Values = PART_CHOICES,
+    Default = "Head",
+    Text = "Target Part",
+})
+
+aimboxBox:AddSlider("AimbotSmoothness", {
+    Text = "Smoothness",
+    Default = 8,
+    Min = 1,
+    Max = 20,
+    Rounding = 0,
+    Tooltip = "Higher = snappier. 1 = slow drag, 20 = near-instant snap.",
+})
+
+aimboxBox:AddToggle("AimbotUseFOV", {
+    Text = "Use FOV",
+    Default = true,
+    Tooltip = "Only lock the camera onto enemies within the FOV radius.",
+})
+
+local triggerBox = Tabs.Combat:AddLeftGroupbox("Triggerbot")
+
+triggerBox:AddToggle("Triggerbot", {
+    Text = "Triggerbot",
+    Default = false,
+    Tooltip = "Auto-fire the currently held gun the moment the mouse cursor lands on an enemy character.",
+}):AddKeyPicker("TriggerbotKey", {
+    Default = "None",
+    SyncToggleState = true,
+    Mode = "Toggle",
+    Text = "Triggerbot",
+})
+
+triggerBox:AddSlider("TriggerActivationDelay", {
+    Text = "Activation Delay",
+    Default = 40,
+    Min = 0,
+    Max = 500,
+    Rounding = 0,
+    Suffix = " ms",
+    Tooltip = "How long the mouse must be over an enemy before firing. Higher = more human-looking.",
+})
+
+triggerBox:AddSlider("TriggerCooldown", {
+    Text = "Fire Cooldown",
+    Default = 120,
+    Min = 50,
+    Max = 1000,
+    Rounding = 0,
+    Suffix = " ms",
+    Tooltip = "Minimum time between consecutive triggerbot shots.",
+})
+
+triggerBox:AddToggle("TriggerUseFOV", {
+    Text = "Use FOV",
+    Default = false,
+    Tooltip = "Also require the target to be within the FOV radius, on top of the mouse-over check.",
+})
+
+local manipBox = Tabs.Combat:AddRightGroupbox("Manipulation")
+
+manipBox:AddToggle("BulletManipulation", {
+    Text = "Bullet Manipulation",
+    Default = false,
+    Tooltip = "Overrides the client-side hit part / normal so the server's hit-registration payload always describes a hit on the aimed part. Bullets connect through walls and around corners. Requires Silent Aim on.",
+})
+
+manipBox:AddToggle("MagicBullet", {
+    Text = "Magic Bullet",
+    Default = false,
+    Tooltip = "When Bullet Manipulation is on, force the reported hit part to the target's Head for max damage — overrides the Silent Aim part choice.",
+})
+
+local fovBox = Tabs.Combat:AddLeftGroupbox("FOV Circle")
+
+fovBox:AddToggle("ShowFOV", {
+    Text = "Draw FOV",
+    Default = false,
+    Tooltip = "Render a circle around the cursor at the FOV radius so you can see exactly what silent aim / aimbot will consider.",
+})
+
+fovBox:AddSlider("FOVSize", {
+    Text = "FOV Radius",
+    Default = 120,
+    Min = 10,
+    Max = 500,
+    Rounding = 0,
+    Suffix = " px",
+})
+
+fovBox:AddLabel("FOV Color"):AddColorPicker("FOVColor", {
+    Default = Color3.fromRGB(255, 100, 100),
+    Title = "FOV Color",
+})
+
+-- FOV visualization ───────────────────────────────────────────────────────
+
+local function destroyFOV()
+    if state.combat.fov.conn then state.combat.fov.conn:Disconnect(); state.combat.fov.conn = nil end
+    if state.combat.fov.sgui then state.combat.fov.sgui:Destroy(); state.combat.fov.sgui = nil end
+    state.combat.fov.ring = nil
+    state.combat.fov.stroke = nil
+end
+
+local function buildFOV()
+    destroyFOV()
+    local sgui = Instance.new("ScreenGui")
+    sgui.Name = "pengooin_FOV"
+    sgui.IgnoreGuiInset = true
+    sgui.ResetOnSpawn = false
+    sgui.DisplayOrder = 90
+    sgui.Parent = lp:FindFirstChildOfClass("PlayerGui")
+    state.combat.fov.sgui = sgui
+
+    local ring = Instance.new("Frame")
+    ring.AnchorPoint = Vector2.new(0.5, 0.5)
+    ring.BackgroundTransparency = 1
+    ring.BorderSizePixel = 0
+    ring.Size = UDim2.fromOffset(240, 240)
+    ring.Parent = sgui
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Thickness = 1.5
+    stroke.Color = Options.FOVColor.Value
+    stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    stroke.Parent = ring
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(1, 0)
+    corner.Parent = ring
+
+    state.combat.fov.ring = ring
+    state.combat.fov.stroke = stroke
+
+    state.combat.fov.conn = RunService.RenderStepped:Connect(function()
+        if not Toggles.ShowFOV.Value then
+            ring.Visible = false
+            return
+        end
+        local m = lp:GetMouse()
+        local r = Options.FOVSize.Value
+        ring.Size = UDim2.fromOffset(r * 2, r * 2)
+        ring.Position = UDim2.fromOffset(m.X, m.Y + 36)
+        ring.Visible = true
+        stroke.Color = Options.FOVColor.Value
+    end)
+end
+
+Toggles.ShowFOV:OnChanged(function()
+    if Toggles.ShowFOV.Value then buildFOV() else destroyFOV() end
+end)
+
+-- Aimbot ──────────────────────────────────────────────────────────────────
+
+local function stopAimbot()
+    if state.combat.aimbot.conn then state.combat.aimbot.conn:Disconnect(); state.combat.aimbot.conn = nil end
+end
+
+local function startAimbot()
+    stopAimbot()
+    state.combat.aimbot.conn = RunService.RenderStepped:Connect(function(dt)
+        if not Toggles.Aimbot.Value then return end
+        -- Require the aim key to be held (KeyPicker in Hold mode). If no key is
+        -- bound, treat as always-on.
+        local kp = Options.AimbotKey
+        local keyBound = kp and kp.Value and kp.Value ~= "None"
+        if keyBound and not kp:GetState() then return end
+
+        local useFOV = Toggles.AimbotUseFOV.Value
+        local fov = Options.FOVSize.Value
+        local target = pickClosestEnemy(useFOV, fov)
+        if not target then return end
+
+        local part = resolvePart(target.Character, Options.AimbotPart.Value)
+        if not part then return end
+
+        local smooth = Options.AimbotSmoothness.Value / 20
+        local aimAt = part.Position + part.AssemblyLinearVelocity * 0.03
+        local goal = CFrame.new(camera.CFrame.Position, aimAt)
+        camera.CFrame = camera.CFrame:Lerp(goal, math.clamp(smooth * dt * 60, 0, 1))
+    end)
+end
+
+Toggles.Aimbot:OnChanged(function()
+    if Toggles.Aimbot.Value then startAimbot() else stopAimbot() end
+end)
+
+-- Triggerbot ──────────────────────────────────────────────────────────────
+
+-- Fire the currently held gun once. Uses the same shoot pipeline as manual
+-- fire so the shared GunHandler.shoot hook (silent aim / bullet manip) still
+-- applies. Reads gun state directly instead of firing tool.Activated because
+-- rapid-fire may have disabled the Activated listener.
+local function fireOneShot()
+    local char = lp.Character
+    if not char then return end
+    local tool = char:FindFirstChildWhichIsA("Tool")
+    if not tool then return end
+    if not tool:FindFirstChild("Handle") or not tool:FindFirstChild("Ammo") then return end
+    if tool.Ammo.Value <= 0 then
+        MainEvent:FireServer("Reload", tool)
+        return
+    end
+    if tool:GetAttribute("Cooldown") then return end
+
+    local origin, handle = getMuzzle(tool)
+    if not origin or not handle then return end
+    local range = (tool:FindFirstChild("Range") and tool.Range.Value) or 200
+    local remote = tool:FindFirstChild("RemoteEvent")
+
+    if remote then remote:FireServer("Shoot") end
+    local dir = GunHandler.getAim(origin, range)
+    local aim = origin + dir * range
+    local a, b, c = GunHandler.shoot({
+        Shooter = char,
+        Handle = handle,
+        ForcedOrigin = origin,
+        AimPosition = aim,
+        Range = range,
+        BeamColor = Color3.new(1, 0.545098, 0.14902),
+    })
+    MainEvent:FireServer("ShootGun", handle, origin, a, b, c)
+    if remote then remote:FireServer() end
+end
+
+local function stopTriggerbot()
+    if state.combat.triggerbot.conn then state.combat.triggerbot.conn:Disconnect(); state.combat.triggerbot.conn = nil end
+end
+
+local function startTriggerbot()
+    stopTriggerbot()
+    local seenAt = 0
+    state.combat.triggerbot.conn = RunService.Heartbeat:Connect(function()
+        if not Toggles.Triggerbot.Value then seenAt = 0; return end
+
+        local m = lp:GetMouse()
+        local hit = m.Target
+        if not hit then seenAt = 0; return end
+        local model = hit:FindFirstAncestorOfClass("Model")
+        local target = model and Players:GetPlayerFromCharacter(model)
+        if not target or not isValidEnemy(target) then seenAt = 0; return end
+
+        if Toggles.TriggerUseFOV.Value then
+            local head = target.Character:FindFirstChild("Head")
+            if head then
+                local sp, on = camera:WorldToScreenPoint(head.Position)
+                if not on or sp.Z <= 0 then seenAt = 0; return end
+                local dx, dy = sp.X - m.X, sp.Y - m.Y
+                if math.sqrt(dx * dx + dy * dy) > Options.FOVSize.Value then
+                    seenAt = 0; return
+                end
+            end
+        end
+
+        local now = tick()
+        if seenAt == 0 then seenAt = now; return end
+        local delay = (Options.TriggerActivationDelay.Value or 0) / 1000
+        local cooldown = (Options.TriggerCooldown.Value or 120) / 1000
+        if now - seenAt < delay then return end
+        if now - state.combat.triggerbot.lastFireAt < cooldown then return end
+
+        state.combat.triggerbot.lastFireAt = now
+        fireOneShot()
+    end)
+end
+
+Toggles.Triggerbot:OnChanged(function()
+    if Toggles.Triggerbot.Value then startTriggerbot() else stopTriggerbot() end
+end)
+
 -- Magic bullet hook: intercept GunHandler.shoot once. When a target is
 -- selected, force AimPosition/Hit/Normal to the target's Head so the payload
 -- sent to MainEvent("ShootGun") reports a head hit — regardless of walls,
@@ -1423,32 +1850,69 @@ end)
 -- Version sentinel so live-diagnostic probes can confirm this exact revision
 -- of the hook is installed (bump the string on every semantic change to the
 -- shoot hook, ragebot gating logic, or magic-bullet payload).
-_G.pengooin_HookVersion = "2026-09-24-stomp-stay-until-dead"
+_G.pengooin_HookVersion = "2026-09-24-combat-overhaul"
 
+-- Shared shoot hook. Two independent aim-override paths:
+--   1. Ragebot (highest priority when its toggle is on) — always magic-bullets
+--      the selected target's Head. Same behavior as before the combat tab.
+--   2. Combat tab Silent Aim — closest-to-cursor enemy pick, configurable part,
+--      optional FOV gate, optional Bullet Manipulation (wall bypass via Hit /
+--      Normal override), optional Magic Bullet (force Head as reported hit).
+-- Only one path runs per shot; ragebot wins when both are enabled.
 do
     local origShoot = GunHandler.shoot
     GunHandler.shoot = function(args)
-        -- Magic-bullet only fires while Ragebot is toggled on. Rapid Fire and
-        -- manual clicks pass straight through when Ragebot is off, so aim
-        -- behaves normally when the user only wants faster fire.
-        local ragebotOn = Toggles.Ragebot and Toggles.Ragebot.Value
-        if ragebotOn and args and typeof(args) == "table" then
-            local t = getTargetPlayer()
-            if t and targetAlive(t) and not targetDowned(t) and not shouldSkipTarget(t) then
-                local head = targetHead(t)
-                if head then
-                    local lead = head.AssemblyLinearVelocity * 0.03
-                    local aim = head.Position + lead
+        if args and typeof(args) == "table" then
+            local ragebotOn = Toggles.Ragebot and Toggles.Ragebot.Value
 
-                    args.AimPosition = aim
-                    args.Hit = head
-                    args.Normal = (args.ForcedOrigin and (args.ForcedOrigin - aim).Magnitude > 0)
-                        and (args.ForcedOrigin - aim).Unit
-                        or Vector3.new(0, 1, 0)
+            if ragebotOn then
+                local t = getTargetPlayer()
+                if t and targetAlive(t) and not targetDowned(t) and not shouldSkipTarget(t) then
+                    local head = targetHead(t)
+                    if head then
+                        local lead = head.AssemblyLinearVelocity * 0.03
+                        local aim = head.Position + lead
+                        args.AimPosition = aim
+                        args.Hit = head
+                        args.Normal = (args.ForcedOrigin and (args.ForcedOrigin - aim).Magnitude > 0)
+                            and (args.ForcedOrigin - aim).Unit
+                            or Vector3.new(0, 1, 0)
+                        if args.ForcedOrigin and args.Range then
+                            local dist = (aim - args.ForcedOrigin).Magnitude
+                            if dist > args.Range then args.Range = dist + 25 end
+                        end
+                    end
+                end
+            elseif Toggles.SilentAim and Toggles.SilentAim.Value then
+                local useFOV = Toggles.SilentAimUseFOV and Toggles.SilentAimUseFOV.Value
+                local fov = Options.FOVSize and Options.FOVSize.Value or 120
+                local t = pickClosestEnemy(useFOV, fov)
+                if t then
+                    local part = resolvePart(t.Character, Options.SilentAimPart.Value)
+                    if part then
+                        local aim = part.Position + part.AssemblyLinearVelocity * 0.03
+                        args.AimPosition = aim
 
-                    if args.ForcedOrigin and args.Range then
-                        local dist = (aim - args.ForcedOrigin).Magnitude
-                        if dist > args.Range then args.Range = dist + 25 end
+                        if Toggles.BulletManipulation and Toggles.BulletManipulation.Value then
+                            local hitPart = part
+                            if Toggles.MagicBullet and Toggles.MagicBullet.Value then
+                                local head = t.Character:FindFirstChild("Head")
+                                if head then
+                                    hitPart = head
+                                    aim = head.Position + head.AssemblyLinearVelocity * 0.03
+                                    args.AimPosition = aim
+                                end
+                            end
+                            args.Hit = hitPart
+                            args.Normal = (args.ForcedOrigin and (args.ForcedOrigin - aim).Magnitude > 0)
+                                and (args.ForcedOrigin - aim).Unit
+                                or Vector3.new(0, 1, 0)
+                        end
+
+                        if args.ForcedOrigin and args.Range then
+                            local dist = (aim - args.ForcedOrigin).Magnitude
+                            if dist > args.Range then args.Range = dist + 25 end
+                        end
                     end
                 end
             end
@@ -1661,6 +2125,9 @@ local function hardCleanup()
     pcall(rbStop)
     pcall(rbShow)
     pcall(stopAutoArmor)
+    pcall(stopAimbot)
+    pcall(stopTriggerbot)
+    pcall(destroyFOV)
     pcall(destroyIndicator)
     -- second sweep on next frame to catch anything a Toggle:OnChanged
     -- callback rebuilt during Unload's teardown.
