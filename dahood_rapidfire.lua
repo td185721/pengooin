@@ -2281,219 +2281,84 @@ Toggles.ESPBox:OnChanged(espRefresh)
 Toggles.ESPName:OnChanged(espRefresh)
 
 -- ── Misc: Chat Spy ────────────────────────────────────────────────────────
--- Da Hood suppresses chat two ways: (1) the built-in TextService filter
--- returns hashtag'd strings for tagged words, and (2) their custom overlay
--- runs a client-side blocklist that outright drops matching lines before
--- they render. We hit the pipeline BEFORE their filter sees it — three
--- vectors so at least one wins on any Da Hood build:
---   1. Player.Chatted (fires from the server-broadcast chat signal every
---      client receives — untouched by the overlay filter)
---   2. TextChatService.MessageReceived (newer TCS-based chat frames)
---   3. DefaultChatSystemChatEvents.OnMessageDoneFiltering (legacy pipeline
---      remote — carries FromSpeaker + Message before any GUI touches it)
--- Everything captured lands in our own ScreenGui window AND optional console.
+-- Da Hood ships its own custom chat GUI and disables Roblox's default one
+-- (CoreGui.Chat off + TextChatService.ChatWindowConfiguration.Enabled = false)
+-- so their client-side filter is the only thing rendering messages. Flip the
+-- defaults back on and the default Roblox chat window prints every incoming
+-- broadcast raw — filter never runs.
+--
+-- Maintenance loop re-applies the flags every 2s in case Da Hood polls them.
+
+local StarterGui = game:GetService("StarterGui")
 
 local chatBox = Tabs.Misc:AddLeftGroupbox("Chat Spy")
 
 chatBox:AddToggle("ChatSpy", {
     Text = "Chat Spy",
     Default = false,
-    Tooltip = "Capture every incoming chat line before Da Hood's client-side filter drops it. Own overlay in the bottom-left.",
+    Tooltip = "Force-enable the default Roblox chat window that Da Hood hides. Da Hood's custom filter never touches the default pipeline — you see every message the server broadcasts.",
 })
 
-chatBox:AddToggle("ChatSpyConsole", {
-    Text = "Also Print to Dev Console",
-    Default = false,
-    Tooltip = "Mirror every captured message to the F9 developer console.",
-})
+local spy = { active = false, restore = nil, thread = nil }
 
-chatBox:AddSlider("ChatSpyHistory", {
-    Text = "History Lines",
-    Default = 120,
-    Min = 20,
-    Max = 500,
-    Rounding = 0,
-    Tooltip = "How many recent lines the overlay keeps before recycling old ones.",
-})
-
-local spy = { active = false, conns = {}, playerConns = {}, gui = nil, list = nil, idx = 0 }
-
-local function spyBuildGui()
-    if spy.gui then return end
-    local pg = lp:FindFirstChildOfClass("PlayerGui")
-    if not pg then return end
-
-    local sg = Instance.new("ScreenGui")
-    sg.Name = "pengooin_ChatSpy"
-    sg.ResetOnSpawn = false
-    sg.IgnoreGuiInset = true
-    sg.DisplayOrder = 50
-    sg.Parent = pg
-
-    local frame = Instance.new("Frame")
-    frame.Size = UDim2.fromOffset(440, 260)
-    frame.Position = UDim2.new(0, 20, 1, -300)
-    frame.BackgroundColor3 = Color3.fromRGB(15, 15, 20)
-    frame.BackgroundTransparency = 0.15
-    frame.BorderSizePixel = 0
-    frame.Active = true
-    frame.Draggable = true
-    frame.Parent = sg
-    Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 6)
-
-    local stroke = Instance.new("UIStroke")
-    stroke.Color = Color3.fromRGB(60, 60, 80)
-    stroke.Thickness = 1
-    stroke.Parent = frame
-
-    local title = Instance.new("TextLabel")
-    title.Size = UDim2.new(1, -12, 0, 22)
-    title.Position = UDim2.fromOffset(8, 4)
-    title.BackgroundTransparency = 1
-    title.TextColor3 = Color3.fromRGB(210, 210, 230)
-    title.Text = "pengooin  ·  chat spy"
-    title.Font = Enum.Font.Code
-    title.TextSize = 12
-    title.TextXAlignment = Enum.TextXAlignment.Left
-    title.Parent = frame
-
-    local list = Instance.new("ScrollingFrame")
-    list.Size = UDim2.new(1, -12, 1, -34)
-    list.Position = UDim2.fromOffset(6, 28)
-    list.BackgroundTransparency = 1
-    list.BorderSizePixel = 0
-    list.ScrollBarThickness = 4
-    list.ScrollBarImageColor3 = Color3.fromRGB(120, 120, 140)
-    list.CanvasSize = UDim2.new(0, 0, 0, 0)
-    list.AutomaticCanvasSize = Enum.AutomaticSize.Y
-    list.ScrollingDirection = Enum.ScrollingDirection.Y
-    list.Parent = frame
-
-    local layout = Instance.new("UIListLayout")
-    layout.SortOrder = Enum.SortOrder.LayoutOrder
-    layout.Padding = UDim.new(0, 1)
-    layout.Parent = list
-
-    spy.gui = sg
-    spy.list = list
+local function tcsWindow()
+    local t = game:GetService("TextChatService")
+    local w = pcall(function() return t.ChatWindowConfiguration end) and t.ChatWindowConfiguration or nil
+    return w
+end
+local function tcsInput()
+    local t = game:GetService("TextChatService")
+    local i = pcall(function() return t.ChatInputBarConfiguration end) and t.ChatInputBarConfiguration or nil
+    return i
+end
+local function tcsBubble()
+    local t = game:GetService("TextChatService")
+    local b = pcall(function() return t.BubbleChatConfiguration end) and t.BubbleChatConfiguration or nil
+    return b
 end
 
-local function spyDestroyGui()
-    if spy.gui then spy.gui:Destroy(); spy.gui = nil; spy.list = nil end
-end
-
-local TAG_COLOR = {
-    chatted = Color3.fromRGB(180, 230, 180),
-    tcs     = Color3.fromRGB(180, 200, 240),
-    legacy  = Color3.fromRGB(240, 220, 170),
-    remote  = Color3.fromRGB(240, 180, 200),
-}
-
-local function spyPush(who, msg, tag)
-    if Toggles.ChatSpyConsole.Value then
-        print(string.format("[chat-spy/%s] %s: %s", tag or "?", who, msg))
-    end
-    if not spy.list then return end
-
-    spy.idx += 1
-    local line = Instance.new("TextLabel")
-    line.LayoutOrder = spy.idx
-    line.Size = UDim2.new(1, -6, 0, 0)
-    line.AutomaticSize = Enum.AutomaticSize.Y
-    line.BackgroundTransparency = 1
-    line.TextColor3 = TAG_COLOR[tag] or Color3.fromRGB(230, 230, 240)
-    line.Text = string.format("[%s] %s: %s", tag or "chat", who, msg)
-    line.Font = Enum.Font.Code
-    line.TextSize = 12
-    line.TextXAlignment = Enum.TextXAlignment.Left
-    line.TextYAlignment = Enum.TextYAlignment.Top
-    line.TextWrapped = true
-    line.RichText = false
-    line.Parent = spy.list
-
-    local cap = Options.ChatSpyHistory.Value or 120
-    local threshold = spy.idx - cap
-    for _, k in spy.list:GetChildren() do
-        if k:IsA("TextLabel") and k.LayoutOrder <= threshold then
-            k:Destroy()
-        end
-    end
-end
-
-local function spyHookPlayer(p)
-    if p == lp then return end
-    if spy.playerConns[p] then return end
-    spy.playerConns[p] = p.Chatted:Connect(function(msg)
-        if not spy.active then return end
-        spyPush(p.Name, msg, "chatted")
-    end)
-end
-
-local function spyUnhookPlayer(p)
-    local c = spy.playerConns[p]
-    if c then pcall(function() c:Disconnect() end); spy.playerConns[p] = nil end
+local function applyEnabled(on)
+    pcall(function() StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Chat, on) end)
+    local w = tcsWindow(); if w then pcall(function() w.Enabled = on end) end
+    local i = tcsInput();  if i then pcall(function() i.Enabled = on end) end
+    local b = tcsBubble(); if b then pcall(function() b.Enabled = on end) end
 end
 
 local function spyStart()
     if spy.active then return end
     spy.active = true
-    spyBuildGui()
 
-    for _, p in Players:GetPlayers() do spyHookPlayer(p) end
-    table.insert(spy.conns, Players.PlayerAdded:Connect(spyHookPlayer))
-    table.insert(spy.conns, Players.PlayerRemoving:Connect(spyUnhookPlayer))
+    spy.restore = {}
+    pcall(function() spy.restore.core = StarterGui:GetCoreGuiEnabled(Enum.CoreGuiType.Chat) end)
+    local w = tcsWindow(); if w then pcall(function() spy.restore.win = w.Enabled end) end
+    local i = tcsInput();  if i then pcall(function() spy.restore.input = i.Enabled end) end
+    local b = tcsBubble(); if b then pcall(function() spy.restore.bubble = b.Enabled end) end
 
-    local TextChatService = game:GetService("TextChatService")
-    if TextChatService then
-        local ok, sig = pcall(function() return TextChatService.MessageReceived end)
-        if ok and sig then
-            table.insert(spy.conns, sig:Connect(function(m)
-                if not spy.active then return end
-                local who = "SYSTEM"
-                pcall(function()
-                    if m.TextSource and m.TextSource.Name then who = m.TextSource.Name end
-                end)
-                local text = ""
-                pcall(function() text = m.Text or "" end)
-                spyPush(who, text, "tcs")
-            end))
-        end
-    end
+    applyEnabled(true)
 
-    local dsce = ReplicatedStorage:FindFirstChild("DefaultChatSystemChatEvents")
-    if dsce then
-        local omdf = dsce:FindFirstChild("OnMessageDoneFiltering")
-        if omdf and omdf:IsA("RemoteEvent") then
-            table.insert(spy.conns, omdf.OnClientEvent:Connect(function(data)
-                if not spy.active then return end
-                if type(data) ~= "table" then return end
-                local who = data.FromSpeaker or data.From or "?"
-                local msg = data.Message or data.MessageLength and "[filtered]" or ""
-                if msg == "" and typeof(data.MessageLengthUtf8) == "number" then
-                    msg = string.rep("_", data.MessageLengthUtf8)
-                end
-                spyPush(who, msg, "legacy")
-            end))
+    spy.thread = task.spawn(function()
+        while spy.active do
+            applyEnabled(true)
+            for _ = 1, 120 do
+                if not spy.active then break end
+                RunService.Heartbeat:Wait()
+            end
         end
-        local omr = dsce:FindFirstChild("OnMessageReceived")
-        if omr and omr:IsA("RemoteEvent") then
-            table.insert(spy.conns, omr.OnClientEvent:Connect(function(data)
-                if not spy.active then return end
-                if type(data) ~= "table" then return end
-                local who = data.FromSpeaker or data.From or "?"
-                local msg = data.Message or ""
-                spyPush(who, msg, "legacy")
-            end))
-        end
-    end
+    end)
 end
 
 local function spyStop()
+    if not spy.active then return end
     spy.active = false
-    for _, c in spy.conns do pcall(function() c:Disconnect() end) end
-    table.clear(spy.conns)
-    for p, c in spy.playerConns do pcall(function() c:Disconnect() end); spy.playerConns[p] = nil end
-    spyDestroyGui()
+    local t = spy.thread; spy.thread = nil
+    if t then pcall(task.cancel, t) end
+
+    local r = spy.restore or {}
+    pcall(function() if r.core ~= nil then StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Chat, r.core) end end)
+    local w = tcsWindow(); if w and r.win ~= nil then pcall(function() w.Enabled = r.win end) end
+    local i = tcsInput();  if i and r.input ~= nil then pcall(function() i.Enabled = r.input end) end
+    local b = tcsBubble(); if b and r.bubble ~= nil then pcall(function() b.Enabled = r.bubble end) end
+    spy.restore = nil
 end
 
 Toggles.ChatSpy:OnChanged(function()
