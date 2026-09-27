@@ -718,11 +718,53 @@ buildBuyTab()
 
 -- ── Ragebot ──
 
-local function randomVoidPos()
+-- Park positions the ragebot uses between shot cycles. The old build sat at
+-- Y ∈ [-500, -300], which is diagnostic on its own — no legitimate player is
+-- ever that far below the map. Anticheat / manual review flags that instantly.
+--
+-- New scheme picks from three plausible modes, weighted, so our server-visible
+-- position looks like something a real player could actually be at:
+--   1. Skybox camp  — Y ∈ [450, 750], anywhere on the map. Snipers / trolls do this.
+--   2. Rooftop-tier — Y ∈ [40, 90],   anywhere on the map. Real building tops.
+--   3. Target orbit — near current target, 120–260 studs offset at their own Y.
+--                     Looks like we're just at a distance, not out-of-map.
+--
+-- HRP rotation is randomized per park so we're not always facing +Z.
+local function randomParkPos(target)
+    local roll = math.random()
+    if target and target.Character then
+        local tHRP = target.Character:FindFirstChild("HumanoidRootPart")
+        if tHRP and roll < 0.5 then
+            -- Target orbit: sit at a random compass bearing, moderate distance,
+            -- their Y ± a few studs. Matches what a "nearby but not engaging"
+            -- player's position telemetry looks like.
+            local angle = math.random() * math.pi * 2
+            local dist = 120 + math.random() * 140
+            local yJitter = (math.random() - 0.5) * 8
+            return Vector3.new(
+                tHRP.Position.X + math.cos(angle) * dist,
+                tHRP.Position.Y + yJitter,
+                tHRP.Position.Z + math.sin(angle) * dist
+            )
+        end
+    end
+
+    if roll < 0.75 then
+        -- Skybox: high enough that no ragebot beam origin points here from
+        -- ground level. Common camper altitude in Da Hood.
+        return Vector3.new(
+            math.random(-1200, 1200),
+            math.random(450, 750),
+            math.random(-1200, 1200)
+        )
+    end
+
+    -- Rooftop tier: within the map, mid-altitude. Not visually distinguishable
+    -- from someone standing on any of the buildings.
     return Vector3.new(
-        math.random(-1500, 1500),
-        math.random(-500, -300),
-        math.random(-1500, 1500)
+        math.random(-1200, 1200),
+        math.random(40, 90),
+        math.random(-1200, 1200)
     )
 end
 
@@ -934,23 +976,46 @@ local function rbTeleport(pos)
     hrp.CFrame = CFrame.new(pos)
 end
 
+-- Park: pick a plausible spot, teleport there with a randomized facing so
+-- our HRP rotation isn't identical every cycle (another cheap tell).
 local function rbParkVoid()
     local hrp = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
     if not hrp then return end
-    hrp.CFrame = CFrame.new(randomVoidPos())
+    local pos = randomParkPos(getTargetPlayer())
+    local yaw = math.random() * math.pi * 2
+    hrp.CFrame = CFrame.new(pos) * CFrame.Angles(0, yaw, 0)
     hrp.AssemblyLinearVelocity = Vector3.zero
 end
 
+-- Hold at a park position with micro-jitter each frame so we don't sit as a
+-- perfectly still point (perfectly still + far from action is also a signal).
+-- Re-parks fully every ~30-45 frames so we don't drift into a bad spot, and
+-- always re-parks the moment we detect we've slid outside the plausible-Y
+-- band (which would happen if physics started applying — e.g. gravity while
+-- at a rooftop-tier Y).
 local function rbHoldVoid(frames)
+    local reparkCountdown = math.random(30, 45)
     for i = 1, frames do
         if not state.ragebot.active then break end
-        -- Re-fetch HRP every frame — if we die mid-hold, the old reference
-        -- points at a destroyed part and any write throws. Skip cleanly and
-        -- let the outer loop / CharacterAdded handler pick up the new char.
         local hrp = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
         if hrp and hrp.Parent then
-            if hrp.Position.Y > -250 then
-                hrp.CFrame = CFrame.new(randomVoidPos())
+            reparkCountdown -= 1
+            local y = hrp.Position.Y
+            -- Re-park hard when: countdown hit zero, or we drifted out of any
+            -- plausible band (below map, or above skybox). Y range [30, 800]
+            -- covers rooftop through skybox camp.
+            if reparkCountdown <= 0 or y < 30 or y > 800 then
+                rbParkVoid()
+                reparkCountdown = math.random(30, 45)
+            else
+                -- Micro-jitter: tiny per-frame nudge, well under the 4-stud
+                -- delta cap, so telemetry sees us "moving" not "frozen".
+                local jitter = Vector3.new(
+                    (math.random() - 0.5) * 0.6,
+                    (math.random() - 0.5) * 0.3,
+                    (math.random() - 0.5) * 0.6
+                )
+                hrp.CFrame = hrp.CFrame + jitter
             end
             hrp.AssemblyLinearVelocity = Vector3.zero
         end
