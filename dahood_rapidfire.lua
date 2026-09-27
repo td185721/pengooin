@@ -2396,7 +2396,21 @@ local function hardCleanup()
     end)
 end
 
-Tabs.Settings:AddLeftGroupbox("Menu"):AddButton({
+local MenuGroup = Tabs.Settings:AddLeftGroupbox("Menu")
+
+MenuGroup:AddLabel("Menu Toggle"):AddKeyPicker("MenuKeybind", {
+    Default = "End",
+    NoUI = false,
+    Text = "Menu Toggle",
+    Mode = "Toggle",
+})
+
+-- Linoria reads Library.ToggleKeybind for its own show/hide logic. Assigning
+-- the KeyPicker here lets dj rebind on the fly and the change persists via
+-- SaveManager alongside every other config value.
+Library.ToggleKeybind = Options.MenuKeybind
+
+MenuGroup:AddButton({
     Text = "Unload",
     Func = function()
         hardCleanup()
