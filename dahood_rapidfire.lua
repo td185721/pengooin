@@ -257,6 +257,8 @@ local Tabs = {
     Movement = Window:AddTab("Movement"),
     Buy = Window:AddTab("Buy"),
     Ragebot = Window:AddTab("Ragebot"),
+    Visuals = Window:AddTab("Visuals"),
+    Misc = Window:AddTab("Misc"),
     Settings = Window:AddTab("Settings"),
 }
 
@@ -2082,6 +2084,422 @@ lp.CharacterAdded:Connect(function(char)
     if Toggles.WalkSpeed and Toggles.WalkSpeed.Value then startSpeed() end
 end)
 
+-- ── Visuals: ESP ──────────────────────────────────────────────────────────
+-- Drawing API renders above the 3D scene without a BillboardGui per player,
+-- so we scale to full lobbies cheap. One Quad + one Text per player, mapped
+-- in a table keyed on the Player instance; PlayerRemoving tears them down.
+
+local espBox = Tabs.Visuals:AddLeftGroupbox("Player ESP")
+
+espBox:AddToggle("ESPBox", {
+    Text = "Box ESP",
+    Default = false,
+    Tooltip = "Screen-space bounding rectangle around every living player.",
+})
+
+espBox:AddToggle("ESPName", {
+    Text = "Name ESP",
+    Default = false,
+    Tooltip = "Player name rendered above the head. Source selectable below.",
+})
+
+espBox:AddDropdown("ESPNameSource", {
+    Values = {"Display Name", "Username"},
+    Default = "Display Name",
+    Text = "Name Source",
+    Tooltip = "Display Name = the styled name shown on the Roblox profile. Username = the underlying @handle used to log in.",
+})
+
+espBox:AddSlider("ESPMaxDist", {
+    Text = "Max Distance",
+    Default = 500,
+    Min = 50,
+    Max = 3000,
+    Rounding = 0,
+    Suffix = " studs",
+    Tooltip = "Hide ESP for players farther than this from your character.",
+})
+
+espBox:AddLabel("Box Color"):AddColorPicker("ESPBoxColor", {
+    Default = Color3.fromRGB(255, 255, 255),
+    Title = "Box Color",
+})
+
+espBox:AddLabel("Name Color"):AddColorPicker("ESPNameColor", {
+    Default = Color3.fromRGB(255, 255, 255),
+    Title = "Name Color",
+})
+
+local esp = { conn = nil, objs = {}, playerConns = {} }
+
+local function espDestroyOne(plr)
+    local o = esp.objs[plr]
+    if not o then return end
+    pcall(function() o.box:Remove() end)
+    pcall(function() o.name:Remove() end)
+    esp.objs[plr] = nil
+end
+
+local function espEnsure(plr)
+    if esp.objs[plr] then return esp.objs[plr] end
+    if not Drawing then return nil end
+    local ok, o = pcall(function()
+        local box = Drawing.new("Quad")
+        box.Thickness = 1
+        box.Filled = false
+        box.Visible = false
+        box.Color = Color3.fromRGB(255, 255, 255)
+        box.Transparency = 1
+
+        local name = Drawing.new("Text")
+        name.Size = 14
+        name.Center = true
+        name.Outline = true
+        name.OutlineColor = Color3.new(0, 0, 0)
+        name.Font = 2
+        name.Visible = false
+        name.Color = Color3.fromRGB(255, 255, 255)
+
+        return { box = box, name = name }
+    end)
+    if ok then
+        esp.objs[plr] = o
+        return o
+    end
+    return nil
+end
+
+local function espStop()
+    if esp.conn then esp.conn:Disconnect(); esp.conn = nil end
+    for _, c in esp.playerConns do pcall(function() c:Disconnect() end) end
+    table.clear(esp.playerConns)
+    for plr, _ in esp.objs do espDestroyOne(plr) end
+end
+
+local function espStart()
+    espStop()
+    if not Drawing then
+        Library:Notify("ESP: executor lacks Drawing API", 4)
+        return
+    end
+
+    table.insert(esp.playerConns, Players.PlayerRemoving:Connect(espDestroyOne))
+
+    esp.conn = RunService.RenderStepped:Connect(function()
+        local boxOn = Toggles.ESPBox.Value
+        local nameOn = Toggles.ESPName.Value
+        if not boxOn and not nameOn then
+            for _, o in esp.objs do o.box.Visible = false; o.name.Visible = false end
+            return
+        end
+
+        local maxDist = Options.ESPMaxDist.Value
+        local myChar = lp.Character
+        local myHRP = myChar and myChar:FindFirstChild("HumanoidRootPart")
+        local boxColor = Options.ESPBoxColor.Value
+        local nameColor = Options.ESPNameColor.Value
+
+        for _, plr in Players:GetPlayers() do
+            if plr == lp then continue end
+            local char = plr.Character
+            local hrp = char and char:FindFirstChild("HumanoidRootPart")
+            local head = char and char:FindFirstChild("Head")
+            local hum = char and char:FindFirstChildOfClass("Humanoid")
+            local o = espEnsure(plr)
+            if not o then continue end
+
+            if not hrp or not head or not hum or hum.Health <= 0 then
+                o.box.Visible = false; o.name.Visible = false
+                continue
+            end
+
+            if myHRP then
+                local d = (myHRP.Position - hrp.Position).Magnitude
+                if d > maxDist then
+                    o.box.Visible = false; o.name.Visible = false
+                    continue
+                end
+            end
+
+            -- Compute vertical extent from head-top to HRP-bottom in world,
+            -- project to viewport, derive width from height (2:3 body ratio).
+            local topPos = (head.CFrame * CFrame.new(0, 0.6, 0)).Position
+            local botPos = (hrp.CFrame * CFrame.new(0, -3, 0)).Position
+            local topScr, topOn = camera:WorldToViewportPoint(topPos)
+            local botScr, botOn = camera:WorldToViewportPoint(botPos)
+
+            if not topOn or not botOn or topScr.Z <= 0 or botScr.Z <= 0 then
+                o.box.Visible = false; o.name.Visible = false
+                continue
+            end
+
+            local h = math.abs(botScr.Y - topScr.Y)
+            local w = h * 0.55
+            local cx = (topScr.X + botScr.X) / 2
+            local topY = math.min(topScr.Y, botScr.Y)
+            local botY = math.max(topScr.Y, botScr.Y)
+
+            if boxOn then
+                o.box.PointA = Vector2.new(cx - w / 2, topY)
+                o.box.PointB = Vector2.new(cx + w / 2, topY)
+                o.box.PointC = Vector2.new(cx + w / 2, botY)
+                o.box.PointD = Vector2.new(cx - w / 2, botY)
+                o.box.Color = boxColor
+                o.box.Visible = true
+            else
+                o.box.Visible = false
+            end
+
+            if nameOn then
+                local src = Options.ESPNameSource.Value
+                local label
+                if src == "Username" then
+                    label = plr.Name
+                else
+                    label = plr.DisplayName ~= "" and plr.DisplayName or plr.Name
+                end
+                o.name.Text = label
+                o.name.Position = Vector2.new(cx, topY - 18)
+                o.name.Color = nameColor
+                o.name.Visible = true
+            else
+                o.name.Visible = false
+            end
+        end
+    end)
+end
+
+local function espRefresh()
+    if Toggles.ESPBox.Value or Toggles.ESPName.Value then
+        espStart()
+    else
+        espStop()
+    end
+end
+
+Toggles.ESPBox:OnChanged(espRefresh)
+Toggles.ESPName:OnChanged(espRefresh)
+
+-- ── Misc: Chat Spy ────────────────────────────────────────────────────────
+-- Da Hood suppresses chat two ways: (1) the built-in TextService filter
+-- returns hashtag'd strings for tagged words, and (2) their custom overlay
+-- runs a client-side blocklist that outright drops matching lines before
+-- they render. We hit the pipeline BEFORE their filter sees it — three
+-- vectors so at least one wins on any Da Hood build:
+--   1. Player.Chatted (fires from the server-broadcast chat signal every
+--      client receives — untouched by the overlay filter)
+--   2. TextChatService.MessageReceived (newer TCS-based chat frames)
+--   3. DefaultChatSystemChatEvents.OnMessageDoneFiltering (legacy pipeline
+--      remote — carries FromSpeaker + Message before any GUI touches it)
+-- Everything captured lands in our own ScreenGui window AND optional console.
+
+local chatBox = Tabs.Misc:AddLeftGroupbox("Chat Spy")
+
+chatBox:AddToggle("ChatSpy", {
+    Text = "Chat Spy",
+    Default = false,
+    Tooltip = "Capture every incoming chat line before Da Hood's client-side filter drops it. Own overlay in the bottom-left.",
+})
+
+chatBox:AddToggle("ChatSpyConsole", {
+    Text = "Also Print to Dev Console",
+    Default = false,
+    Tooltip = "Mirror every captured message to the F9 developer console.",
+})
+
+chatBox:AddSlider("ChatSpyHistory", {
+    Text = "History Lines",
+    Default = 120,
+    Min = 20,
+    Max = 500,
+    Rounding = 0,
+    Tooltip = "How many recent lines the overlay keeps before recycling old ones.",
+})
+
+local spy = { active = false, conns = {}, playerConns = {}, gui = nil, list = nil, idx = 0 }
+
+local function spyBuildGui()
+    if spy.gui then return end
+    local pg = lp:FindFirstChildOfClass("PlayerGui")
+    if not pg then return end
+
+    local sg = Instance.new("ScreenGui")
+    sg.Name = "pengooin_ChatSpy"
+    sg.ResetOnSpawn = false
+    sg.IgnoreGuiInset = true
+    sg.DisplayOrder = 50
+    sg.Parent = pg
+
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.fromOffset(440, 260)
+    frame.Position = UDim2.new(0, 20, 1, -300)
+    frame.BackgroundColor3 = Color3.fromRGB(15, 15, 20)
+    frame.BackgroundTransparency = 0.15
+    frame.BorderSizePixel = 0
+    frame.Active = true
+    frame.Draggable = true
+    frame.Parent = sg
+    Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 6)
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.fromRGB(60, 60, 80)
+    stroke.Thickness = 1
+    stroke.Parent = frame
+
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, -12, 0, 22)
+    title.Position = UDim2.fromOffset(8, 4)
+    title.BackgroundTransparency = 1
+    title.TextColor3 = Color3.fromRGB(210, 210, 230)
+    title.Text = "pengooin  ·  chat spy"
+    title.Font = Enum.Font.Code
+    title.TextSize = 12
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Parent = frame
+
+    local list = Instance.new("ScrollingFrame")
+    list.Size = UDim2.new(1, -12, 1, -34)
+    list.Position = UDim2.fromOffset(6, 28)
+    list.BackgroundTransparency = 1
+    list.BorderSizePixel = 0
+    list.ScrollBarThickness = 4
+    list.ScrollBarImageColor3 = Color3.fromRGB(120, 120, 140)
+    list.CanvasSize = UDim2.new(0, 0, 0, 0)
+    list.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    list.ScrollingDirection = Enum.ScrollingDirection.Y
+    list.Parent = frame
+
+    local layout = Instance.new("UIListLayout")
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Padding = UDim.new(0, 1)
+    layout.Parent = list
+
+    spy.gui = sg
+    spy.list = list
+end
+
+local function spyDestroyGui()
+    if spy.gui then spy.gui:Destroy(); spy.gui = nil; spy.list = nil end
+end
+
+local TAG_COLOR = {
+    chatted = Color3.fromRGB(180, 230, 180),
+    tcs     = Color3.fromRGB(180, 200, 240),
+    legacy  = Color3.fromRGB(240, 220, 170),
+    remote  = Color3.fromRGB(240, 180, 200),
+}
+
+local function spyPush(who, msg, tag)
+    if Toggles.ChatSpyConsole.Value then
+        print(string.format("[chat-spy/%s] %s: %s", tag or "?", who, msg))
+    end
+    if not spy.list then return end
+
+    spy.idx += 1
+    local line = Instance.new("TextLabel")
+    line.LayoutOrder = spy.idx
+    line.Size = UDim2.new(1, -6, 0, 0)
+    line.AutomaticSize = Enum.AutomaticSize.Y
+    line.BackgroundTransparency = 1
+    line.TextColor3 = TAG_COLOR[tag] or Color3.fromRGB(230, 230, 240)
+    line.Text = string.format("[%s] %s: %s", tag or "chat", who, msg)
+    line.Font = Enum.Font.Code
+    line.TextSize = 12
+    line.TextXAlignment = Enum.TextXAlignment.Left
+    line.TextYAlignment = Enum.TextYAlignment.Top
+    line.TextWrapped = true
+    line.RichText = false
+    line.Parent = spy.list
+
+    local cap = Options.ChatSpyHistory.Value or 120
+    local threshold = spy.idx - cap
+    for _, k in spy.list:GetChildren() do
+        if k:IsA("TextLabel") and k.LayoutOrder <= threshold then
+            k:Destroy()
+        end
+    end
+end
+
+local function spyHookPlayer(p)
+    if p == lp then return end
+    if spy.playerConns[p] then return end
+    spy.playerConns[p] = p.Chatted:Connect(function(msg)
+        if not spy.active then return end
+        spyPush(p.Name, msg, "chatted")
+    end)
+end
+
+local function spyUnhookPlayer(p)
+    local c = spy.playerConns[p]
+    if c then pcall(function() c:Disconnect() end); spy.playerConns[p] = nil end
+end
+
+local function spyStart()
+    if spy.active then return end
+    spy.active = true
+    spyBuildGui()
+
+    for _, p in Players:GetPlayers() do spyHookPlayer(p) end
+    table.insert(spy.conns, Players.PlayerAdded:Connect(spyHookPlayer))
+    table.insert(spy.conns, Players.PlayerRemoving:Connect(spyUnhookPlayer))
+
+    local TextChatService = game:GetService("TextChatService")
+    if TextChatService then
+        local ok, sig = pcall(function() return TextChatService.MessageReceived end)
+        if ok and sig then
+            table.insert(spy.conns, sig:Connect(function(m)
+                if not spy.active then return end
+                local who = "SYSTEM"
+                pcall(function()
+                    if m.TextSource and m.TextSource.Name then who = m.TextSource.Name end
+                end)
+                local text = ""
+                pcall(function() text = m.Text or "" end)
+                spyPush(who, text, "tcs")
+            end))
+        end
+    end
+
+    local dsce = ReplicatedStorage:FindFirstChild("DefaultChatSystemChatEvents")
+    if dsce then
+        local omdf = dsce:FindFirstChild("OnMessageDoneFiltering")
+        if omdf and omdf:IsA("RemoteEvent") then
+            table.insert(spy.conns, omdf.OnClientEvent:Connect(function(data)
+                if not spy.active then return end
+                if type(data) ~= "table" then return end
+                local who = data.FromSpeaker or data.From or "?"
+                local msg = data.Message or data.MessageLength and "[filtered]" or ""
+                if msg == "" and typeof(data.MessageLengthUtf8) == "number" then
+                    msg = string.rep("_", data.MessageLengthUtf8)
+                end
+                spyPush(who, msg, "legacy")
+            end))
+        end
+        local omr = dsce:FindFirstChild("OnMessageReceived")
+        if omr and omr:IsA("RemoteEvent") then
+            table.insert(spy.conns, omr.OnClientEvent:Connect(function(data)
+                if not spy.active then return end
+                if type(data) ~= "table" then return end
+                local who = data.FromSpeaker or data.From or "?"
+                local msg = data.Message or ""
+                spyPush(who, msg, "legacy")
+            end))
+        end
+    end
+end
+
+local function spyStop()
+    spy.active = false
+    for _, c in spy.conns do pcall(function() c:Disconnect() end) end
+    table.clear(spy.conns)
+    for p, c in spy.playerConns do pcall(function() c:Disconnect() end); spy.playerConns[p] = nil end
+    spyDestroyGui()
+end
+
+Toggles.ChatSpy:OnChanged(function()
+    if Toggles.ChatSpy.Value then spyStart() else spyStop() end
+end)
+
 -- ── Settings ──
 
 ThemeManager:SetLibrary(Library)
@@ -2104,6 +2522,8 @@ local function hardCleanup()
     pcall(stopTriggerbot)
     pcall(destroyFOV)
     pcall(destroyIndicator)
+    pcall(espStop)
+    pcall(spyStop)
     -- second sweep on next frame to catch anything a Toggle:OnChanged
     -- callback rebuilt during Unload's teardown.
     task.defer(function()
