@@ -632,12 +632,13 @@ local function fpSnapshotBuy(item)
 end
 
 local function silentBuy(item)
-    -- Fake pos active → snapshot-swap path (character stays visible, no
-    -- local teleport). Falls through to legacy hide+teleport if snapshot
-    -- mode isn't engaged or the swap can't get a shop snapshot.
+    -- Fake pos active → snapshot-swap path ONLY. Never fall through to the
+    -- legacy hide+camera-freeze+teleport branch, which visibly makes the
+    -- character disappear (character teleports to shop while camera stays
+    -- locked at origin → dj sees themselves vanish from view). Under fake
+    -- pos we accept a failed buy over that visual.
     if state.fakePos.active and state.fakePos.snapshot then
-        local ok = fpSnapshotBuy(item)
-        if ok then return true end
+        return fpSnapshotBuy(item)
     end
 
     local char = lp.Character
