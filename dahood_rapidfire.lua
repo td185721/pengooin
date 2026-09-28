@@ -2832,13 +2832,39 @@ local function buildIndicator()
                 worldPos = hd and hd.Position
             end
             if not worldPos then vis.dot.Visible = false; return end
-            local sp, onScreen = camera:WorldToScreenPoint(worldPos)
-            if onScreen and sp.Z > 0 then
-                vis.dot.Position = UDim2.fromOffset(sp.X, sp.Y)
-                vis.dot.Visible = true
-            else
-                vis.dot.Visible = false
+
+            local sp = camera:WorldToViewportPoint(worldPos)
+            local vp = camera.ViewportSize
+            local behind = sp.Z <= 0
+            local x, y = sp.X, sp.Y
+            if behind then
+                -- Behind camera: reflect through screen center so the dot ends
+                -- up on the opposite edge, pointing the way you'd need to turn.
+                x = vp.X - x
+                y = vp.Y - y
             end
+            -- Off-screen (or behind): clamp to viewport edge with margin so
+            -- the dot stays visible as a pointer instead of disappearing.
+            local margin = 16
+            local minX, maxX = margin, vp.X - margin
+            local minY, maxY = margin, vp.Y - margin
+            local offScreen = behind or x < minX or x > maxX or y < minY or y > maxY
+            if offScreen then
+                -- Ray from screen center to target — clamp intersection to edge
+                local cx, cy = vp.X * 0.5, vp.Y * 0.5
+                local dx, dy = x - cx, y - cy
+                local scale = math.huge
+                if dx ~= 0 then
+                    scale = math.min(scale, (dx > 0 and (maxX - cx) or (cx - minX)) / math.abs(dx))
+                end
+                if dy ~= 0 then
+                    scale = math.min(scale, (dy > 0 and (maxY - cy) or (cy - minY)) / math.abs(dy))
+                end
+                if scale == math.huge then scale = 0 end
+                x, y = cx + dx * scale, cy + dy * scale
+            end
+            vis.dot.Position = UDim2.fromOffset(x, y)
+            vis.dot.Visible = true
         end)
     end
 end
