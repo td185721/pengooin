@@ -61,7 +61,7 @@ local state = {
     fakePos = {
         active = false,
         hook = nil,
-        template = nil,                                          -- reserved (unused in current Block-based build)
+        snapshot = nil,                                          -- captured 161 payload (array of bytes) — replayed on every outgoing 161 so server sees us frozen at safe pos while local HRP walks freely
         fireBypass = false,                                      -- true = pass packets unmodified so ragebot shots register
         charConn = nil,
         vizAnchor = nil,                                         -- invisible workspace Part at fake pos
@@ -1993,25 +1993,25 @@ end)
 -- Volt API dependency: raknet.add_send_hook / packet:Block(), both verified
 -- functional 2026-09-28 on live baseplate probes.
 
--- Called from inside a fireBypass=true window (typically at the tail of a
--- ragebot fire cycle) — teleports to safe pos, waits for one physics packet
--- to fly with safe-pos bytes, so the server's cache goes back to safe pos
--- before Block re-engages. Otherwise enemies could attack the strafe-pos
--- server-cache in the seconds between our fire cycles.
+-- Snaps server-visible position back to safe pos WITHOUT teleporting local HRP.
+-- Under snapshot mode: engaging replay (fireBypass=false) causes the next
+-- outgoing 161 to carry snapshot bytes → server cache resets to safe pos.
+-- We nudge HRP by a sub-visible fraction so a physics packet emits on the
+-- next Heartbeat instead of waiting for the ~10-15Hz natural cadence — the
+-- nudged packet is then intercepted by the replay hook and overwritten with
+-- the snapshot bytes. Total local displacement: 0.001 studs, invisible.
+-- Callers typically flip fireBypass=false after this returns (redundant but
+-- harmless — we set it here too).
 fpReseedInline = function()
     if not state.fakePos.active then return end
     local char = lp.Character
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
     if not hrp then return end
-    local safeY = (Options.FakePosY and Options.FakePosY.Value) or 1000000
-    -- Nudge with 1-stud writes so at least one physics packet definitely
-    -- fires with safe-pos bytes (a single teleport-and-wait can miss the
-    -- physics tick window at the ~15Hz replication rate).
-    for i = 1, 3 do
-        hrp.CFrame = CFrame.new(i * 1.0, safeY, 0)
-        hrp.AssemblyLinearVelocity = Vector3.zero
-        RunService.Heartbeat:Wait()
-    end
+    -- Engage replay first so the packet we're about to force gets overlaid.
+    state.fakePos.fireBypass = false
+    hrp.CFrame = hrp.CFrame + Vector3.new(0.001, 0, 0)
+    RunService.Heartbeat:Wait()
+    hrp.CFrame = hrp.CFrame - Vector3.new(0.001, 0, 0)
 end
 
 -- Desync visualizer: a floating billboard at the fake-pos location, visible
@@ -2085,29 +2085,41 @@ local function fpCreateVisualizer(safeY)
 end
 
 local function seedFakePos(safeCFrame, timeout)
-    -- Teleport to safe pos, force N physics packets to fly so server's cache
-    -- updates to that pose, then we return. Once Block hook is installed,
-    -- subsequent packets are dropped → server-cached position stays here.
+    -- Teleport to safe pos, capture ONE fully-loaded 161 physics packet at that
+    -- position, return its byte array. Caller replays that payload on every
+    -- outgoing 161 (overlaying only the fresh timestamp bytes 1-4) so the
+    -- server sees us permanently frozen at safe pos while local HRP moves
+    -- freely. Nothing else in the packet needs to be understood — the
+    -- captured bytes already encode a valid physics frame at target pos.
+    -- Ref: blastbrean/raknet-physics + validated live 2026-09-28 (baseplate + DH).
     local char = lp.Character
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
-    if not hrp then return false end
+    if not hrp then return nil end
 
-    local packets_seen = 0
+    local captured
     local h = function(p)
-        if p.PacketId == 161 then packets_seen = packets_seen + 1 end
+        if captured then return end
+        if p.PacketId == 161 and p.Size >= 40 then
+            -- Full-payload physics packet at this HRP position — save bytes as array.
+            captured = p.AsArray
+        end
     end
 
     raknet.add_send_hook(h)
     local deadline = tick() + (timeout or 0.8)
     local i = 0
-    while packets_seen < 3 and tick() < deadline do
+    -- Small-step CFrame nudges force multiple physics ticks at the safe pos
+    -- so we're guaranteed to catch at least one full-payload 161 (rest packets
+    -- can be short "state only" frames without the position block).
+    while not captured and tick() < deadline do
         i = i + 1
         hrp.CFrame = safeCFrame * CFrame.new(i * 1.0, 0, 0)
+        hrp.AssemblyLinearVelocity = Vector3.zero
         RunService.Heartbeat:Wait()
     end
     raknet.remove_send_hook(h)
 
-    return packets_seen >= 2                                          -- need at least 2 to trust
+    return captured                                                   -- byte array or nil on failure
 end
 
 local function stopFakePos()
@@ -2121,6 +2133,7 @@ local function stopFakePos()
         state.fakePos.charConn:Disconnect()
         state.fakePos.charConn = nil
     end
+    state.fakePos.snapshot = nil
     state.fakePos.fireBypass = false
     fpDestroyVisualizer()
 end
@@ -2143,33 +2156,48 @@ local function startFakePos()
     local origCF = hrp.CFrame
     local safeCF = CFrame.new(0, safeY, 0)
 
-    if not seedFakePos(safeCF, 0.8) then
+    local snapshot = seedFakePos(safeCF, 0.8)
+    if not snapshot then
         hrp.CFrame = origCF
-        Library:Notify("Fake Position: seed teleport didn't fire enough packets to trust", 5)
+        Library:Notify("Fake Position: seed didn't capture a physics snapshot", 5)
         return
     end
+    state.fakePos.snapshot = snapshot
 
     state.fakePos.active = true
 
-    -- Block all physics packets (161:*) so server never learns about our
-    -- return to origCF or any subsequent local movement. Fire bypass flag
-    -- lets ragebot code temporarily allow real packets through.
+    -- REPLAY every outgoing 161 with the captured snapshot bytes, refreshing
+    -- only the timestamp header (bytes 1-4 LE u32). Server sees a continuous
+    -- physics stream reporting "same position at safe pos, time advancing" —
+    -- server cache stays pinned to safe pos indefinitely while local HRP is
+    -- free to move anywhere (no Block, no packet drop, no rubberband window).
+    -- fireBypass=true bypasses the replay so real packets can fly (used by
+    -- ragebot fire cycles that need the server to briefly see us at strafe pos).
     state.fakePos.hook = function(p)
         if state.fakePos.fireBypass then return end
         if p.PacketId ~= 161 then return end
-        pcall(function() p:Block() end)
+        local snap = state.fakePos.snapshot
+        if not snap then return end
+        local incoming = p.AsArray
+        -- Overlay fresh timestamp bytes (1-4 → array indices 2-5) onto snapshot.
+        local out = table.clone(snap)
+        out[2], out[3], out[4], out[5] = incoming[2], incoming[3], incoming[4], incoming[5]
+        pcall(function() p:SetData(out) end)
     end
     raknet.add_send_hook(state.fakePos.hook)
 
-    -- Teleport back to where we were before spoof. Server won't see this
-    -- (Block hook is now catching everything).
+    -- Teleport back to where we were before seed. Server sees only the
+    -- replayed snapshot bytes from here on — this local teleport doesn't
+    -- register server-side because the hook overwrites every outbound 161
+    -- with the pinned-at-safe-pos snapshot.
     hrp.CFrame = origCF
     hrp.AssemblyLinearVelocity = Vector3.zero
 
     fpCreateVisualizer(safeY)
 
-    -- Respawn re-seeds so the fresh character's server-cached pos also
-    -- gets pinned to safe pos.
+    -- Respawn re-captures the snapshot for the fresh character (new HRP
+    -- referent lives in the packet's inner bytes, so the old snapshot's
+    -- part-id block would be stale after respawn).
     state.fakePos.charConn = lp.CharacterAdded:Connect(function(newChar)
         newChar:WaitForChild("HumanoidRootPart", 5)
         task.wait(0.4)
@@ -2178,9 +2206,10 @@ local function startFakePos()
         if not nHrp then return end
         local nOrig = nHrp.CFrame
         local nSafeY = (Options.FakePosY and Options.FakePosY.Value) or safeY
-        -- Temporarily bypass so seed packets fly through
+        -- Bypass replay while we re-capture so real packets fly at the seed pos
         state.fakePos.fireBypass = true
-        seedFakePos(CFrame.new(0, nSafeY, 0), 0.6)
+        local snap = seedFakePos(CFrame.new(0, nSafeY, 0), 0.6)
+        if snap then state.fakePos.snapshot = snap end
         state.fakePos.fireBypass = false
         nHrp.CFrame = nOrig
         nHrp.AssemblyLinearVelocity = Vector3.zero
