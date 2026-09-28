@@ -1486,9 +1486,18 @@ end)
 
 -- ── Auto-Reset on Down ────────────────────────────────────────────────────
 -- Watch BodyEffects.K.O / Dead / SDeath + Humanoid.Died. On any flip, force
--- the character to reset via Humanoid.Health = 0 + BreakJoints so we skip the
--- bleedout / getting-stomped window entirely. Optionally capture HRP CFrame
--- at the moment of the down and, on respawn, teleport back to that spot.
+-- the character to reset by destroying its HumanoidRootPart. Optionally
+-- capture HRP CFrame at down-time and teleport back on respawn.
+--
+-- Empirically verified 2026-09-28 against live Da Hood: neither Humanoid.Health
+-- writes, Character:BreakJoints(), void-teleport (server yanks HRP back within
+-- ~250ms), nor MainEvent:FireServer("ResetNew") work during the downed state.
+-- The one path that isn't hooked is a raw :Destroy() on the HumanoidRootPart —
+-- Da Hood's server-side detects the missing HRP and triggers its own respawn
+-- flow, refilling the SAME Character Model instance with fresh parts + a
+-- ForceField (spawn protection) inside ~2-3 seconds. Because the Model is
+-- reused, lp.CharacterAdded doesn't fire on this reset — we detect completion
+-- by polling for a fresh HRP + FULLY_LOADED_CHAR marker + K.O flag cleared.
 
 state.autoReset = {
     active = false,
@@ -1496,6 +1505,7 @@ state.autoReset = {
     watchConns = {},
     savedCF = nil,
     resetting = false,
+    respawnThread = nil,
 }
 
 local resetBox = Tabs.Player:AddRightGroupbox("Auto Reset")
@@ -1519,31 +1529,65 @@ local function clearResetWatch()
     table.clear(state.autoReset.watchConns)
 end
 
--- Da Hood's own reset routes through MainEvent:FireServer("ResetNew") — the
--- exact same call the in-game reset button invokes (PlayerGui.Framework line
--- ~24, bound to StarterGui:SetCore("ResetButtonCallback", ...)). Server-side
--- has a 5s cooldown but NO downed-state guard, so this bypasses the "reset
--- disabled while K.O." UI restriction. Health=0 / BreakJoints are hooked and
--- ignored during downed state — ResetNew is the only working path.
+local watchDownState                                                  -- forward decl
+
 local function doForceReset()
     if state.autoReset.resetting then return end
     state.autoReset.resetting = true
     local char = lp.Character
     if not char then state.autoReset.resetting = false; return end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if not hrp then state.autoReset.resetting = false; return end
+
     if Toggles.AutoResetReturn and Toggles.AutoResetReturn.Value then
-        local hrp = char:FindFirstChild("HumanoidRootPart")
-        if hrp then state.autoReset.savedCF = hrp.CFrame end
+        state.autoReset.savedCF = hrp.CFrame
     end
-    pcall(function() MainEvent:FireServer("ResetNew") end)
-    -- Safety timeout: if the reset doesn't produce a new character within 6s
-    -- (server cooldown / rejection), clear the flag so the next K.O detection
-    -- can retry instead of wedging the auto-reset off.
-    task.delay(6, function()
-        if state.autoReset.resetting then state.autoReset.resetting = false end
+
+    -- The kill: raw :Destroy() on the HRP. Da Hood's downed-state hooks
+    -- catch Humanoid.Health writes / BreakJoints / ResetNew, but not this.
+    pcall(function() hrp:Destroy() end)
+
+    -- Poll for respawn: fresh HRP + FULLY_LOADED_CHAR marker + K.O cleared.
+    -- Runs on a separate thread so we don't block the caller.
+    if state.autoReset.respawnThread then
+        pcall(task.cancel, state.autoReset.respawnThread)
+    end
+    state.autoReset.respawnThread = task.spawn(function()
+        local deadline = tick() + 8
+        while tick() < deadline do
+            if not state.autoReset.active then break end
+            local c = lp.Character
+            if c then
+                local newHRP = c:FindFirstChild("HumanoidRootPart")
+                local loaded = c:FindFirstChild("FULLY_LOADED_CHAR")
+                local be = c:FindFirstChild("BodyEffects")
+                local ko = be and be:FindFirstChild("K.O")
+                local dead = be and be:FindFirstChild("Dead")
+                local koFalse = not ko or not ko.Value
+                local deadFalse = not dead or not dead.Value
+                if newHRP and loaded and koFalse and deadFalse then
+                    if Toggles.AutoResetReturn and Toggles.AutoResetReturn.Value
+                       and state.autoReset.savedCF then
+                        newHRP.CFrame = state.autoReset.savedCF
+                        newHRP.AssemblyLinearVelocity = Vector3.zero
+                        state.autoReset.savedCF = nil
+                    end
+                    state.autoReset.resetting = false
+                    watchDownState(c)                                 -- rebind fresh
+                    state.autoReset.respawnThread = nil
+                    return
+                end
+            end
+            task.wait(0.15)
+        end
+        state.autoReset.resetting = false
+        state.autoReset.savedCF = nil
+        if lp.Character then watchDownState(lp.Character) end
+        state.autoReset.respawnThread = nil
     end)
 end
 
-local function watchDownState(char)
+function watchDownState(char)
     clearResetWatch()
     if not char then return end
 
@@ -1558,7 +1602,7 @@ local function watchDownState(char)
             if val and val:IsA("ValueBase") then
                 table.insert(state.autoReset.watchConns,
                     val:GetPropertyChangedSignal("Value"):Connect(function() checkVal(val) end))
-                checkVal(val)                                 -- catch already-true at bind time
+                checkVal(val)                                         -- catch already-true at bind time
             end
         end
     end
@@ -1587,6 +1631,10 @@ local function stopAutoReset()
         state.autoReset.charConn:Disconnect()
         state.autoReset.charConn = nil
     end
+    if state.autoReset.respawnThread then
+        pcall(task.cancel, state.autoReset.respawnThread)
+        state.autoReset.respawnThread = nil
+    end
     state.autoReset.resetting = false
     state.autoReset.savedCF = nil
 end
@@ -1595,6 +1643,9 @@ local function startAutoReset()
     stopAutoReset()
     state.autoReset.active = true
     if lp.Character then watchDownState(lp.Character) end
+    -- CharacterAdded is a safety net for the rare Da Hood flow that DOES
+    -- swap the Model reference (natural death or admin action). The main
+    -- respawn detection is the poll inside doForceReset.
     state.autoReset.charConn = lp.CharacterAdded:Connect(function(char)
         char:WaitForChild("HumanoidRootPart", 5)
         task.wait(0.3)
