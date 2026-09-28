@@ -1519,6 +1519,12 @@ local function clearResetWatch()
     table.clear(state.autoReset.watchConns)
 end
 
+-- Da Hood's own reset routes through MainEvent:FireServer("ResetNew") — the
+-- exact same call the in-game reset button invokes (PlayerGui.Framework line
+-- ~24, bound to StarterGui:SetCore("ResetButtonCallback", ...)). Server-side
+-- has a 5s cooldown but NO downed-state guard, so this bypasses the "reset
+-- disabled while K.O." UI restriction. Health=0 / BreakJoints are hooked and
+-- ignored during downed state — ResetNew is the only working path.
 local function doForceReset()
     if state.autoReset.resetting then return end
     state.autoReset.resetting = true
@@ -1528,13 +1534,12 @@ local function doForceReset()
         local hrp = char:FindFirstChild("HumanoidRootPart")
         if hrp then state.autoReset.savedCF = hrp.CFrame end
     end
-    -- Health = 0 flips the Died signal on the client Humanoid; BreakJoints is
-    -- the belt-and-suspenders in case Da Hood's replicated humanoid ignores
-    -- the direct health write. Either path lands the reset within one frame.
-    pcall(function()
-        local hum = char:FindFirstChildOfClass("Humanoid")
-        if hum then hum.Health = 0 end
-        char:BreakJoints()
+    pcall(function() MainEvent:FireServer("ResetNew") end)
+    -- Safety timeout: if the reset doesn't produce a new character within 6s
+    -- (server cooldown / rejection), clear the flag so the next K.O detection
+    -- can retry instead of wedging the auto-reset off.
+    task.delay(6, function()
+        if state.autoReset.resetting then state.autoReset.resetting = false end
     end)
 end
 
