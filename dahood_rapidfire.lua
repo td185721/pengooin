@@ -58,6 +58,13 @@ local state = {
         triggerbot = {conn = nil, lastFireAt = 0, keyHeld = false},
         fov = {conn = nil, sgui = nil, ring = nil},
     },
+    fakePos = {
+        active = false,
+        hook = nil,
+        template = nil,                                          -- captured 11-byte position region
+        fireBypass = false,                                      -- true = pass packets unmodified so ragebot shots register
+        charConn = nil,
+    },
 }
 
 local function clearConns()
@@ -1143,6 +1150,11 @@ local function fireOneGun(tool, target, char)
     if remote then remote:FireServer() end
 end
 
+-- Forward decl — fpReseedInline is defined much later (in the Fake Position
+-- section, since it needs Options.FakePosY). Ragebot fire wraps call it, so
+-- we declare the local up here for capture in the closures below.
+local fpReseedInline
+
 local function rbStrafeShoot(target)
     if not selfAlive() then return end
     local char = lp.Character
@@ -1161,13 +1173,19 @@ local function rbStrafeShoot(target)
     local angle = nextStrafeAngle()
     local dist = 6 + math.random() * 8
     local strafePos = tHRP.Position + strafeOffsetAt(angle, dist)
+
+    -- Bypass fake-position rewrite for the strafe→fire→park round trip so
+    -- real physics packets carry our actual strafe HRP position (server's
+    -- origin check needs to see us near the target for the shot to register).
+    state.fakePos.fireBypass = true
+
     hrp.CFrame = CFrame.new(strafePos, tHRP.Position)
     hrp.AssemblyLinearVelocity = Vector3.zero
 
     -- physics replication is ~30Hz — 3 heartbeats (~50ms) is the minimum
     -- window before the server accepts a Shoot RPC with a matching origin.
     for _ = 1, 3 do
-        if not state.ragebot.active then return end
+        if not state.ragebot.active then state.fakePos.fireBypass = false; return end
         RunService.Heartbeat:Wait()
     end
     hrp.CFrame = CFrame.new(strafePos, tHRP.Position)
@@ -1180,6 +1198,12 @@ local function rbStrafeShoot(target)
 
     RunService.Heartbeat:Wait()
     rbParkVoid()
+
+    -- Before releasing fire-bypass, re-seed the server's cache back to the
+    -- safe fake-pos. Otherwise cache stays at strafe/void pos and enemies
+    -- can attack us there in the between-cycles window.
+    fpReseedInline()
+    state.fakePos.fireBypass = false
 end
 
 -- ragdoll can leave HRP floating at the old alive position while the visible
@@ -1268,6 +1292,10 @@ local function rbDetachedShoot(target)
     local offsetY = (Options.DetachedOffsetY and Options.DetachedOffsetY.Value) or 0
     local spinRate = (Options.DetachedSpinRate and Options.DetachedSpinRate.Value) or 5
 
+    -- Bypass fake-position rewrite for the duration of this fire cycle so
+    -- the server's origin check sees our real HRP position (not the spoof).
+    state.fakePos.fireBypass = true
+
     for _, tool in guns do
         if not state.ragebot.active then break end
         local handle = tool:FindFirstChild("Handle")
@@ -1315,6 +1343,11 @@ local function rbDetachedShoot(target)
         -- or a subsequent burst on another gun uses the normal grip.
         restore()
     end
+
+    -- Re-seed safe pos so server's cache returns to fake-pos before Block
+    -- re-engages (see fpReseedInline note).
+    fpReseedInline()
+    state.fakePos.fireBypass = false
 end
 
 local function rbStompCycle(target)
@@ -1334,6 +1367,10 @@ local function rbStompCycle(target)
     --   - ragebot toggle turns off
     -- The updated targetDowned returns FALSE the moment Dead/SDeath flip, so
     -- this loop exits immediately after the killing stomp registers.
+    -- Stomp validation reads server-cached HRP; bypass fake-position so the
+    -- real "on-corpse" packet flies during this whole cycle.
+    state.fakePos.fireBypass = true
+
     local deadline = tick() + 2
     while tick() < deadline and state.ragebot.active and targetDowned(target) do
         local body = findRagdollBody(tChar)
@@ -1344,6 +1381,10 @@ local function rbStompCycle(target)
         pcall(function() MainEvent:FireServer("Stomp") end)
         RunService.Heartbeat:Wait()
     end
+
+    -- Re-seed safe pos before releasing fire-bypass.
+    fpReseedInline()
+    state.fakePos.fireBypass = false
 end
 
 local function rbUpdateSpectate()
@@ -1898,6 +1939,185 @@ end
 
 Toggles.AutoReset:OnChanged(function()
     if Toggles.AutoReset.Value then startAutoReset() else stopAutoReset() end
+end)
+
+-- ── Fake Position (Godmode) ───────────────────────────────────────────────
+-- Continuous server-side position spoof via Volt's RakNet library. Character
+-- stays wherever dj put it locally; ALL outgoing physics packets (161:*)
+-- are dropped via packet:Block(), so the server's cached HRP position stays
+-- frozen at whatever we teleported to during setup (Y=1e6 by default).
+--
+-- Why Block instead of SetData rewrite: Roblox's compressed physics encoding
+-- is variable-length. Position at Y=20 needs different byte count than Y=1e6
+-- (54 vs 62 bytes observed), so pasting a captured template at a fixed byte
+-- offset doesn't work across positions. Blocking every 161 packet is simpler
+-- and doesn't require decoding the format.
+--
+-- Protection mechanism:
+--   Da Hood's server-side gun handler validates
+--       dist(shooter.HRP.Position, ForcedOrigin) < gun.Range
+--   When enemies fire at us, their ForcedOrigin is at ground level while
+--   OUR server-cached HRP is at Y=1e6. Distance = 1e6, gun.Range ~ 200,
+--   check fails, damage rejected. Same math kills melee, stomp, and any
+--   magic-bullet ragebot targeting us.
+--
+-- Ragebot compatibility: rbStrafeShoot / rbDetachedShoot / rbStompCycle
+-- each toggle state.fakePos.fireBypass around their own fire window, so
+-- real physics packets fly during that window (server updates cache to
+-- our real strafe/stomp position), the shot's origin check passes, then
+-- the spoof re-engages (server updates back to the fake position on the
+-- next fire cycle's post-shot bypass=false transition).
+--
+-- Anti-cheat surface: none of Da Hood's CHECKER_* hooks read raknet-layer
+-- data. Block happens after Roblox's engine assembles the packet, before
+-- the wire — invisible to Lua-level detection. Server-only heuristics
+-- ("player position hasn't updated in N ticks") could still flag; testing
+-- on alt required.
+--
+-- Volt API dependency: raknet.add_send_hook / packet:Block(), both verified
+-- functional 2026-09-28 on live baseplate probes.
+
+-- Called from inside a fireBypass=true window (typically at the tail of a
+-- ragebot fire cycle) — teleports to safe pos, waits for one physics packet
+-- to fly with safe-pos bytes, so the server's cache goes back to safe pos
+-- before Block re-engages. Otherwise enemies could attack the strafe-pos
+-- server-cache in the seconds between our fire cycles.
+fpReseedInline = function()
+    if not state.fakePos.active then return end
+    local char = lp.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return end
+    local safeY = (Options.FakePosY and Options.FakePosY.Value) or 1000000
+    hrp.CFrame = CFrame.new(0, safeY, 0)
+    hrp.AssemblyLinearVelocity = Vector3.zero
+    -- Two heartbeats: one for the write to fire a dirty-position packet,
+    -- one for physics replication to settle before caller flips bypass=false.
+    RunService.Heartbeat:Wait()
+    RunService.Heartbeat:Wait()
+end
+
+local function seedFakePos(safeCFrame, timeout)
+    -- Teleport to safe pos, force N physics packets to fly so server's cache
+    -- updates to that pose, then we return. Once Block hook is installed,
+    -- subsequent packets are dropped → server-cached position stays here.
+    local char = lp.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return false end
+
+    local packets_seen = 0
+    local h = function(p)
+        if p.PacketId == 161 then packets_seen = packets_seen + 1 end
+    end
+
+    raknet.add_send_hook(h)
+    local deadline = tick() + (timeout or 0.8)
+    local i = 0
+    while packets_seen < 3 and tick() < deadline do
+        i = i + 1
+        hrp.CFrame = safeCFrame * CFrame.new(i * 1.0, 0, 0)
+        RunService.Heartbeat:Wait()
+    end
+    raknet.remove_send_hook(h)
+
+    return packets_seen >= 2                                          -- need at least 2 to trust
+end
+
+local function stopFakePos()
+    if not state.fakePos.active then return end
+    state.fakePos.active = false
+    if state.fakePos.hook then
+        pcall(function() raknet.remove_send_hook(state.fakePos.hook) end)
+        state.fakePos.hook = nil
+    end
+    if state.fakePos.charConn then
+        state.fakePos.charConn:Disconnect()
+        state.fakePos.charConn = nil
+    end
+    state.fakePos.fireBypass = false
+end
+
+local function startFakePos()
+    stopFakePos()
+
+    if not raknet or not raknet.is_enabled or not raknet.is_enabled() then
+        Library:Notify("Fake Position: enable Volt's RakNet Library in Volt settings first", 6)
+        return
+    end
+
+    local safeY = (Options.FakePosY and Options.FakePosY.Value) or 1000000
+    local char = lp.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not hrp then
+        Library:Notify("Fake Position: no character to spoof", 4)
+        return
+    end
+    local origCF = hrp.CFrame
+    local safeCF = CFrame.new(0, safeY, 0)
+
+    if not seedFakePos(safeCF, 0.8) then
+        hrp.CFrame = origCF
+        Library:Notify("Fake Position: seed teleport didn't fire enough packets to trust", 5)
+        return
+    end
+
+    state.fakePos.active = true
+
+    -- Block all physics packets (161:*) so server never learns about our
+    -- return to origCF or any subsequent local movement. Fire bypass flag
+    -- lets ragebot code temporarily allow real packets through.
+    state.fakePos.hook = function(p)
+        if state.fakePos.fireBypass then return end
+        if p.PacketId ~= 161 then return end
+        pcall(function() p:Block() end)
+    end
+    raknet.add_send_hook(state.fakePos.hook)
+
+    -- Teleport back to where we were before spoof. Server won't see this
+    -- (Block hook is now catching everything).
+    hrp.CFrame = origCF
+    hrp.AssemblyLinearVelocity = Vector3.zero
+
+    -- Respawn re-seeds so the fresh character's server-cached pos also
+    -- gets pinned to safe pos.
+    state.fakePos.charConn = lp.CharacterAdded:Connect(function(newChar)
+        newChar:WaitForChild("HumanoidRootPart", 5)
+        task.wait(0.4)
+        if not state.fakePos.active then return end
+        local nHrp = newChar:FindFirstChild("HumanoidRootPart")
+        if not nHrp then return end
+        local nOrig = nHrp.CFrame
+        local nSafeY = (Options.FakePosY and Options.FakePosY.Value) or safeY
+        -- Temporarily bypass so seed packets fly through
+        state.fakePos.fireBypass = true
+        seedFakePos(CFrame.new(0, nSafeY, 0), 0.6)
+        state.fakePos.fireBypass = false
+        nHrp.CFrame = nOrig
+        nHrp.AssemblyLinearVelocity = Vector3.zero
+    end)
+
+    Library:Notify("Fake Position: active (server sees Y=" .. tostring(safeY) .. ")", 3)
+end
+
+local fpBox = Tabs.Player:AddLeftGroupbox("Fake Position (Godmode)")
+
+fpBox:AddToggle("FakePos", {
+    Text = "Fake Position",
+    Default = false,
+    Tooltip = "Server-side position spoof via Volt's RakNet library. Character stays wherever you are locally; server + all other clients see you at (0, FakePosY, 0). Enemy shots, melee, stomps, and magic-bullet ragebots all fail server-side range checks against your fake position — you take no damage.\n\nRequires Volt's RakNet Library enabled (Volt Settings → Client). Works with pengooin's own Ragebot: fires briefly bypass the spoof so your own shot origin checks pass.",
+})
+
+fpBox:AddSlider("FakePosY", {
+    Text = "Safe Position Y",
+    Default = 1000000,
+    Min = 10000,
+    Max = 10000000,
+    Rounding = 0,
+    Suffix = " studs",
+    Tooltip = "How high the fake position sits. Roblox float precision drops past ~16.7M studs (2^24), so going above 10M risks the CFrame quantizing to a wrong value. Any value >500 puts you beyond all Da Hood weapon ranges (max ~250).",
+})
+
+Toggles.FakePos:OnChanged(function()
+    if Toggles.FakePos.Value then startFakePos() else stopFakePos() end
 end)
 
 -- ── Combat Tab ────────────────────────────────────────────────────────────
@@ -2866,6 +3086,7 @@ local function hardCleanup()
     pcall(rbShow)
     pcall(stopAutoArmor)
     pcall(stopAutoReset)
+    pcall(stopFakePos)
     pcall(stopAimbot)
     pcall(stopTriggerbot)
     pcall(destroyFOV)
