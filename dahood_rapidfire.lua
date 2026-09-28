@@ -61,9 +61,11 @@ local state = {
     fakePos = {
         active = false,
         hook = nil,
-        template = nil,                                          -- captured 11-byte position region
+        template = nil,                                          -- reserved (unused in current Block-based build)
         fireBypass = false,                                      -- true = pass packets unmodified so ragebot shots register
         charConn = nil,
+        vizAnchor = nil,                                         -- invisible workspace Part at fake pos
+        vizBillboard = nil,                                      -- BillboardGui in our PlayerGui adornee'd to vizAnchor
     },
 }
 
@@ -1996,6 +1998,76 @@ fpReseedInline = function()
     RunService.Heartbeat:Wait()
 end
 
+-- Desync visualizer: a floating billboard at the fake-pos location, visible
+-- only to dj. Implementation: an invisible workspace Part at (0, safeY, 0)
+-- (replicates as Transparency=1 = other clients see nothing physically), plus
+-- a BillboardGui parented to OUR PlayerGui (GuiObjects in PlayerGui never
+-- replicate to other clients), with the BillboardGui's Adornee set to the
+-- workspace Part. Result: we see a red "SERVER SEES YOU HERE" panel hovering
+-- at the safe pos, everyone else sees nothing.
+local function fpDestroyVisualizer()
+    if state.fakePos.vizAnchor then
+        pcall(function() state.fakePos.vizAnchor:Destroy() end)
+        state.fakePos.vizAnchor = nil
+    end
+    if state.fakePos.vizBillboard then
+        pcall(function() state.fakePos.vizBillboard:Destroy() end)
+        state.fakePos.vizBillboard = nil
+    end
+end
+
+local function fpCreateVisualizer(safeY)
+    fpDestroyVisualizer()
+    if not Toggles.FakePosViz or not Toggles.FakePosViz.Value then return end
+
+    local anchor = Instance.new("Part")
+    anchor.Name = "pengooin_desync_anchor"
+    anchor.Anchored = true
+    anchor.CanCollide = false
+    anchor.CanQuery = false
+    anchor.CanTouch = false
+    anchor.Transparency = 1                                          -- invisible for all clients (replicates)
+    anchor.Size = Vector3.new(1, 1, 1)
+    anchor.CFrame = CFrame.new(0, safeY, 0)
+    anchor.Parent = workspace
+
+    local pg = lp:FindFirstChildOfClass("PlayerGui")
+    if not pg then return end
+
+    local bg = Instance.new("BillboardGui")
+    bg.Name = "pengooin_desync_ghost"
+    bg.Adornee = anchor
+    bg.Size = UDim2.new(0, 320, 0, 90)
+    bg.StudsOffset = Vector3.new(0, 0, 0)
+    bg.AlwaysOnTop = true
+    bg.MaxDistance = math.huge
+    bg.Parent = pg
+
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.fromScale(1, 1)
+    frame.BackgroundColor3 = Color3.new(0.6, 0, 0)
+    frame.BackgroundTransparency = 0.25
+    frame.BorderSizePixel = 0
+    frame.Parent = bg
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.new(1, 0.2, 0.2)
+    stroke.Thickness = 2
+    stroke.Parent = frame
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.fromScale(1, 1)
+    label.BackgroundTransparency = 1
+    label.Text = "SERVER SEES YOU HERE\nY = " .. tostring(safeY)
+    label.TextColor3 = Color3.new(1, 1, 1)
+    label.TextScaled = true
+    label.Font = Enum.Font.SourceSansBold
+    label.Parent = frame
+
+    state.fakePos.vizAnchor = anchor
+    state.fakePos.vizBillboard = bg
+end
+
 local function seedFakePos(safeCFrame, timeout)
     -- Teleport to safe pos, force N physics packets to fly so server's cache
     -- updates to that pose, then we return. Once Block hook is installed,
@@ -2034,6 +2106,7 @@ local function stopFakePos()
         state.fakePos.charConn = nil
     end
     state.fakePos.fireBypass = false
+    fpDestroyVisualizer()
 end
 
 local function startFakePos()
@@ -2077,6 +2150,8 @@ local function startFakePos()
     hrp.CFrame = origCF
     hrp.AssemblyLinearVelocity = Vector3.zero
 
+    fpCreateVisualizer(safeY)
+
     -- Respawn re-seeds so the fresh character's server-cached pos also
     -- gets pinned to safe pos.
     state.fakePos.charConn = lp.CharacterAdded:Connect(function(newChar)
@@ -2116,8 +2191,46 @@ fpBox:AddSlider("FakePosY", {
     Tooltip = "How high the fake position sits. Roblox float precision drops past ~16.7M studs (2^24), so going above 10M risks the CFrame quantizing to a wrong value. Any value >500 puts you beyond all Da Hood weapon ranges (max ~250).",
 })
 
+fpBox:AddToggle("FakePosViz", {
+    Text = "Show Desync Ghost",
+    Default = true,
+    Tooltip = "Renders a red 'SERVER SEES YOU HERE' billboard at your fake position — visible only to you (BillboardGui parented to your PlayerGui, so it never replicates to other clients). Handy for confirming the desync is actually engaged and knowing where the server thinks you are.",
+})
+
+fpBox:AddButton({
+    Text = "Resync (Snap to Server)",
+    Func = function()
+        -- Teleports the local character to the server's cached position (safe
+        -- pos). Use this before disabling Fake Position to avoid the visual
+        -- snap that happens when the hook releases and server sends a
+        -- correction. After Resync, toggling Fake Position off just unhooks
+        -- cleanly — no rubberband, no confusion about where you are.
+        local char = lp.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        if not hrp then Library:Notify("Resync: no character", 3); return end
+        local safeY = (Options.FakePosY and Options.FakePosY.Value) or 1000000
+        state.fakePos.fireBypass = true
+        hrp.CFrame = CFrame.new(0, safeY, 0)
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        RunService.Heartbeat:Wait()
+        RunService.Heartbeat:Wait()
+        state.fakePos.fireBypass = false
+        Library:Notify("Resynced to server position (Y=" .. tostring(safeY) .. ")", 3)
+    end,
+})
+
 Toggles.FakePos:OnChanged(function()
     if Toggles.FakePos.Value then startFakePos() else stopFakePos() end
+end)
+
+Toggles.FakePosViz:OnChanged(function()
+    if not state.fakePos.active then return end
+    if Toggles.FakePosViz.Value then
+        local safeY = (Options.FakePosY and Options.FakePosY.Value) or 1000000
+        fpCreateVisualizer(safeY)
+    else
+        fpDestroyVisualizer()
+    end
 end)
 
 -- ── Combat Tab ────────────────────────────────────────────────────────────
