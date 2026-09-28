@@ -542,7 +542,105 @@ local function restoreCharacter(restores)
     end
 end
 
+-- Capture a physics-161 snapshot at a shop item's pad position so the
+-- server can be briefly told "we're at that pad" via snapshot swap during
+-- a buy — no local HRP teleport, no visible yank once cached. The initial
+-- capture DOES teleport local HRP briefly (hidden under hideCharacter),
+-- but only the first time we buy that specific item; the result is cached
+-- in state.fakePos.shopSnapshots so every subsequent buy is fully seamless.
+local function fpCaptureShopSnapshot(item)
+    if not state.fakePos.active then return nil end
+    local char = lp.Character
+    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+    if not hrp or not char then return nil end
+    local target = item.model.PrimaryPart or item.model:FindFirstChild("Head")
+    if not target then return nil end
+
+    local origCF = hrp.CFrame
+    local anchor = CFrame.new(target.Position + Vector3.new(-2, 3, 0))
+    local restores = hideCharacter(char)
+
+    -- Bypass replay so real physics packets carry the shop-anchor position
+    state.fakePos.fireBypass = true
+    hrp.CFrame = anchor
+    hrp.AssemblyLinearVelocity = Vector3.zero
+    RunService.Heartbeat:Wait()
+
+    local captured
+    local h = function(p)
+        if captured then return end
+        if p.PacketId == 161 and p.Size >= 40 then captured = p.AsArray end
+    end
+    raknet.add_send_hook(h)
+    for i = 1, 4 do
+        hrp.CFrame = anchor * CFrame.new(i * 0.5, 0, 0)
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        RunService.Heartbeat:Wait()
+    end
+    local t = tick(); while not captured and tick() - t < 0.4 do task.wait(0.03) end
+    raknet.remove_send_hook(h)
+
+    hrp.CFrame = origCF
+    hrp.AssemblyLinearVelocity = Vector3.zero
+    -- fpReseedInline flips fireBypass=false and snaps server back to safe via replay nudge
+    fpReseedInline()
+    restoreCharacter(restores)
+    return captured
+end
+
+-- Snapshot-swap buy: swap active snapshot to the shop-anchor snapshot for a
+-- brief window, fire the ClickDetector (server sees us "at" the shop pad and
+-- accepts the click), then swap back to safe-pos snapshot. Local body never
+-- moves, character stays visible throughout. Requires state.fakePos.active
+-- and a shop snapshot (captured lazily on first buy per item).
+local function fpSnapshotBuy(item)
+    if not state.fakePos.active or not state.fakePos.snapshot then return false end
+    if not state.fakePos.shopSnapshots then state.fakePos.shopSnapshots = {} end
+
+    local shopSnap = state.fakePos.shopSnapshots[item.model]
+    if not shopSnap then
+        shopSnap = fpCaptureShopSnapshot(item)
+        if not shopSnap then return false end
+        state.fakePos.shopSnapshots[item.model] = shopSnap
+    end
+
+    local moneyStart = moneyValue()
+    local safeSnap = state.fakePos.snapshot
+    -- Swap snapshot — hook now replays shop bytes on every outgoing 161.
+    -- Server cache converges to shop pos within a few packets (~50-100ms).
+    state.fakePos.snapshot = shopSnap
+    for _ = 1, 4 do RunService.Heartbeat:Wait() end
+
+    local pricePaid = 0
+    for burst = 1, 6 do
+        for i = 1, 15 do
+            pcall(fireclickdetector, item.cd)
+            RunService.Heartbeat:Wait()
+        end
+        local spent = moneyStart - moneyValue()
+        if spent > pricePaid then
+            pricePaid = spent
+            if item.amount == nil then break end
+            if item.price and spent >= item.price then break end
+        end
+    end
+
+    -- Swap back to safe snapshot; server cache returns to safe pos.
+    state.fakePos.snapshot = safeSnap
+    for _ = 1, 2 do RunService.Heartbeat:Wait() end
+
+    return pricePaid > 0
+end
+
 local function silentBuy(item)
+    -- Fake pos active → snapshot-swap path (character stays visible, no
+    -- local teleport). Falls through to legacy hide+teleport if snapshot
+    -- mode isn't engaged or the swap can't get a shop snapshot.
+    if state.fakePos.active and state.fakePos.snapshot then
+        local ok = fpSnapshotBuy(item)
+        if ok then return true end
+    end
+
     local char = lp.Character
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
     local hum = char and char:FindFirstChildOfClass("Humanoid")
@@ -2134,6 +2232,7 @@ local function stopFakePos()
         state.fakePos.charConn = nil
     end
     state.fakePos.snapshot = nil
+    state.fakePos.shopSnapshots = nil
     state.fakePos.fireBypass = false
     fpDestroyVisualizer()
 end
