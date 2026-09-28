@@ -47,6 +47,7 @@ local state = {
         origCF = nil,
         renderBind = nil,
         clone = nil,
+        targetIdx = 1,                                        -- rotation index into RagebotTargets multi-select
     },
     autoArmor = {
         active = false,
@@ -780,13 +781,44 @@ local function strafeOffsetAt(angle, distance)
     return Vector3.new(math.cos(angle) * distance, math.random(-1, 2), math.sin(angle) * distance)
 end
 
-local function getTargetPlayer()
-    local name = Options.RagebotTarget and Options.RagebotTarget.Value
-    if not name or name == "None" then return nil end
+-- Multi-target rotation. Options.RagebotTargets is a Multi dropdown whose
+-- Value is {name = true/false, ...}. We compile it to a stable sorted list of
+-- selected names and use state.ragebot.targetIdx to point at the current one.
+-- Rotation advances by advanceTarget() after each successful stomp cycle so
+-- the ragebot goes: kill target A → stomp → kill target B → stomp → ...
+local function getSelectedTargetNames()
+    local sel = Options.RagebotTargets and Options.RagebotTargets.Value or {}
+    local names = {}
+    if typeof(sel) == "table" then
+        for name, on in sel do
+            if on then table.insert(names, name) end
+        end
+    end
+    table.sort(names)                                                 -- stable rotation order
+    return names
+end
+
+local function playerByName(name)
+    if not name then return nil end
     for _, p in Players:GetPlayers() do
         if p.Name == name or p.DisplayName == name then return p end
     end
     return nil
+end
+
+local function advanceTarget()
+    local names = getSelectedTargetNames()
+    if #names == 0 then return end
+    state.ragebot.targetIdx = (state.ragebot.targetIdx % #names) + 1
+end
+
+local function getTargetPlayer()
+    local names = getSelectedTargetNames()
+    if #names == 0 then return nil end
+    if state.ragebot.targetIdx > #names or state.ragebot.targetIdx < 1 then
+        state.ragebot.targetIdx = 1
+    end
+    return playerByName(names[state.ragebot.targetIdx])
 end
 
 local function targetAlive(p)
@@ -1233,21 +1265,34 @@ local function rbLoop()
         rbUpdateSpectate()
         local target = getTargetPlayer()
         if not target or not target.Parent then
+            -- Current slot is empty (player left server or selection empty).
+            -- Advance to give the next slot a turn; loop back if all empty.
+            if #getSelectedTargetNames() > 0 then advanceTarget() end
             rbHoldVoid(6)
             continue
         end
 
-        if not targetAlive(target) or shouldSkipTarget(target) then
+        if not targetAlive(target) then
+            -- Someone / something else killed this target — skip past them
+            -- so the rotation stays productive instead of parking on a corpse.
+            advanceTarget()
+            rbHoldVoid(4)
+            continue
+        end
+
+        if shouldSkipTarget(target) then
+            -- Suppress-fire (e.g. Invulnerable) — hold on this target, don't
+            -- advance; the rotation waits until they're shootable again.
             rbHoldVoid(6)
             continue
         end
 
         if targetDowned(target) and Toggles.RagebotAutoStomp.Value then
             rbStompCycle(target)
-            -- Stomp cycle exits pinned on the body (or wherever findRagdollBody
-            -- last put us). Yank to void and idle a few frames so Dead/SDeath
-            -- propagation is stable before the next iteration's targetAlive
-            -- check — which will skip the corpse until respawn.
+            -- Stomp landed → target Dead flag flipped. Move to the next slot
+            -- in the rotation so the ragebot keeps producing kills instead
+            -- of waiting on the corpse to respawn.
+            advanceTarget()
             rbParkVoid()
             rbHoldVoid(4)
             continue
@@ -1291,21 +1336,28 @@ end
 local rageBox = Tabs.Ragebot:AddLeftGroupbox("Target")
 
 local function refreshTargets()
-    local names = {"None"}
+    local names = {}
     for _, p in Players:GetPlayers() do
         if p ~= lp then table.insert(names, p.Name) end
     end
-    if Options.RagebotTarget then
-        Options.RagebotTarget:SetValues(names)
+    if Options.RagebotTargets then
+        Options.RagebotTargets:SetValues(names)
     end
 end
 
-rageBox:AddDropdown("RagebotTarget", {
-    Values = {"None"},
-    Default = "None",
-    Text = "Target Player",
-    Tooltip = "Player to hunt. List refreshes when players join/leave.",
+rageBox:AddDropdown("RagebotTargets", {
+    Values = {},
+    Default = nil,
+    Multi = true,
+    Text = "Target Players",
+    Tooltip = "Pick one or more players. Ragebot rotates: kill target → stomp → move to next → repeat. List refreshes when players join/leave.",
 })
+
+-- Reset rotation index whenever the selection changes so we always start
+-- with the first selected target after edits.
+Options.RagebotTargets:OnChanged(function()
+    state.ragebot.targetIdx = 1
+end)
 
 rageBox:AddButton({
     Text = "Refresh Player List",
