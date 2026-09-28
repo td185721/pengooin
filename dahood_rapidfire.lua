@@ -1200,6 +1200,123 @@ local function findRagdollBody(tChar)
     return best
 end
 
+-- ── Detached Handle mode ──────────────────────────────────────────────────
+-- Alternate ragebot fire path. Per shot: briefly offset the gun's Handle to
+-- the target's position via Motor6D.C0, fire with ForcedOrigin = Muzzle
+-- (which now sits at target), restore the C0 immediately. Handle spends
+-- ~50ms per shot at the target and the rest of the time in the shooter's
+-- hand — manual fire outside a ragebot burst is unaffected.
+--
+-- Anti-cheat audit 2026-09-28:
+--   • CHECKER_4 hooks Tool.Grip writes only. Motor6D.C0 is NOT watched.
+--   • CHECKER_1 hooks BodyMover additions only. Motor6D unrelated.
+--   • No client-side listener on Handle.Position/CFrame or Motor6D property
+--     signals; grepped for :GetPropertyChangedSignal("C0"/"C1"/"Part0"/"Part1"
+--     with zero hits in Da Hood client code.
+--   • Server-side dist(Shooter.HRP, ForcedOrigin) tolerance is unknown. If
+--     kills stop registering, the DetachedOffsetY slider is the tuning knob
+--     (0 = Handle exactly at target head; positive = above; negative = below).
+
+local function findGripMotor(char, tool)
+    if not char or not tool then return nil end
+    local handle = tool:FindFirstChild("Handle")
+    if not handle then return nil end
+    for _, name in {"RightHand", "LeftHand"} do
+        local h = char:FindFirstChild(name)
+        if h then
+            for _, c in h:GetChildren() do
+                if c:IsA("Motor6D") and c.Part1 == handle then return c end
+            end
+        end
+    end
+    return nil
+end
+
+-- Places tool.Handle at worldCF via a Motor6D.C0 write. Returns a restore
+-- closure that puts the original C0 (and Transform) back so the gun snaps
+-- back into the shooter's hand.
+local function detachHandleFor(char, tool, worldCF)
+    local m = findGripMotor(char, tool)
+    if not m or not m.Part0 then return function() end end
+    local origC0 = m.C0
+    local origTransform = m.Transform
+    pcall(function()
+        m.Transform = CFrame.identity
+        m.C0 = m.Part0.CFrame:ToObjectSpace(worldCF)
+    end)
+    return function()
+        pcall(function()
+            if m.Parent then
+                m.C0 = origC0
+                m.Transform = origTransform
+            end
+        end)
+    end
+end
+
+local function rbDetachedShoot(target)
+    if not selfAlive() then return end
+    local char = lp.Character
+    if not char then return end
+    local guns = collectSelectedGuns()
+    if #guns == 0 then return end
+    ensureGunsEquipped(guns, char)
+
+    local tHead = targetHead(target)
+    if not tHead then return end
+
+    local offsetY = (Options.DetachedOffsetY and Options.DetachedOffsetY.Value) or 0
+    local spinRate = (Options.DetachedSpinRate and Options.DetachedSpinRate.Value) or 5
+
+    for _, tool in guns do
+        if not state.ragebot.active then break end
+        local handle = tool:FindFirstChild("Handle")
+        if not handle then continue end
+        local ammoObj = tool:FindFirstChild("Ammo")
+        if not ammoObj then continue end
+        if ammoObj.Value <= 0 then
+            MainEvent:FireServer("Reload", tool)
+            continue
+        end
+
+        local spin = tick() * spinRate
+        local worldCF = CFrame.new(tHead.Position + Vector3.new(0, offsetY, 0))
+                        * CFrame.Angles(spin, spin * 0.7, spin * 1.3)
+
+        local restore = detachHandleFor(char, tool, worldCF)
+
+        -- Wait one heartbeat for the offset to replicate to the server before
+        -- reading Muzzle.WorldPosition (which now reflects the offset Handle).
+        RunService.Heartbeat:Wait()
+
+        local def = tool:FindFirstChild("Default")
+        local muzzle = def and def:FindFirstChild("Mesh") and def.Mesh:FindFirstChild("Muzzle")
+        local origin = muzzle and muzzle.WorldPosition or handle.Position
+
+        local range = (tool:FindFirstChild("Range") and tool.Range.Value) or 200
+        local remote = tool:FindFirstChild("RemoteEvent")
+        if remote then remote:FireServer("Shoot") end
+
+        local aim = tHead.Position + tHead.AssemblyLinearVelocity * 0.03
+        local dist = (aim - origin).Magnitude
+
+        local a, b, c = GunHandler.shoot({
+            Shooter = char,
+            Handle = handle,
+            ForcedOrigin = origin,
+            AimPosition = aim,
+            Range = math.max(range, dist + 25),
+            BeamColor = Color3.new(1, 0.2, 0.2),
+        })
+        MainEvent:FireServer("ShootGun", handle, origin, a, b, c)
+        if remote then remote:FireServer() end
+
+        -- Snap Handle back into the hand right after the shot — manual fire
+        -- or a subsequent burst on another gun uses the normal grip.
+        restore()
+    end
+end
+
 local function rbStompCycle(target)
     if not selfAlive() then return end
     local char = lp.Character
@@ -1246,12 +1363,32 @@ local function rbUpdateSpectate()
     end
 end
 
+local function isDetached()
+    return Toggles.DetachedFire and Toggles.DetachedFire.Value
+end
+
+-- Wait helper that DOESN'T teleport us — used between shot cycles when in
+-- Detached mode. rbHoldVoid always parks the character in void, which is
+-- the wrong behavior when we're supposed to be standing at a normal spot.
+local function rbIdleWait(frames)
+    for _ = 1, frames do
+        if not state.ragebot.active then break end
+        RunService.Heartbeat:Wait()
+    end
+end
+
 local function rbLoop()
     if not waitSelfAlive(600) then return end
-    rbHide()
-    rbUpdateSpectate()
-    rbParkVoid()
-    rbHoldVoid(3)
+    local detachedAtStart = isDetached()
+    if not detachedAtStart then
+        rbHide()
+        rbUpdateSpectate()
+        rbParkVoid()
+        rbHoldVoid(3)
+    else
+        -- Detached mode: character stays wherever it is. No hide, no park.
+        rbUpdateSpectate()
+    end
 
     while state.ragebot.active do
         -- Death guard: if we're dead / mid-respawn, wait for humanoid to come
@@ -1264,45 +1401,45 @@ local function rbLoop()
 
         rbUpdateSpectate()
         local target = getTargetPlayer()
+        local detached = isDetached()
+
         if not target or not target.Parent then
-            -- Current slot is empty (player left server or selection empty).
-            -- Advance to give the next slot a turn; loop back if all empty.
             if #getSelectedTargetNames() > 0 then advanceTarget() end
-            rbHoldVoid(6)
+            if detached then rbIdleWait(6) else rbHoldVoid(6) end
             continue
         end
 
         if not targetAlive(target) then
-            -- Someone / something else killed this target — skip past them
-            -- so the rotation stays productive instead of parking on a corpse.
             advanceTarget()
-            rbHoldVoid(4)
+            if detached then rbIdleWait(4) else rbHoldVoid(4) end
             continue
         end
 
         if shouldSkipTarget(target) then
-            -- Suppress-fire (e.g. Invulnerable) — hold on this target, don't
-            -- advance; the rotation waits until they're shootable again.
-            rbHoldVoid(6)
+            if detached then rbIdleWait(6) else rbHoldVoid(6) end
             continue
         end
 
         if targetDowned(target) and Toggles.RagebotAutoStomp.Value then
             rbStompCycle(target)
-            -- Stomp landed → target Dead flag flipped. Move to the next slot
-            -- in the rotation so the ragebot keeps producing kills instead
-            -- of waiting on the corpse to respawn.
             advanceTarget()
-            rbParkVoid()
-            rbHoldVoid(4)
+            if detached then
+                rbIdleWait(4)                                         -- no park in detached mode
+            else
+                rbParkVoid()
+                rbHoldVoid(4)
+            end
             continue
         end
 
-        rbStrafeShoot(target)
+        if detached then
+            rbDetachedShoot(target)
+        else
+            rbStrafeShoot(target)
+        end
 
-        -- rest in void between shot cycles. no spam — just sit still.
         local waitFrames = math.max(1, math.floor(Options.RagebotDelay.Value * 60))
-        rbHoldVoid(waitFrames)
+        if detached then rbIdleWait(waitFrames) else rbHoldVoid(waitFrames) end
     end
 end
 
@@ -1420,6 +1557,33 @@ runBox:AddSlider("RagebotDelay", {
     Max = 1.0,
     Rounding = 2,
     Tooltip = "Seconds between shot bursts from void",
+})
+
+local detachBox = Tabs.Ragebot:AddRightGroupbox("Detached Handle")
+
+detachBox:AddToggle("DetachedFire", {
+    Text = "Detached Handle Mode",
+    Default = false,
+    Tooltip = "Alternate fire mode. Character stays in place — the gun's Handle briefly offsets to the target via Motor6D.C0 for each shot, then snaps back to your hand. Target sees the gun near them with the bullet originating from there. Bypasses the strafe teleport entirely. Manual fire outside a ragebot burst is unaffected (Handle is only offset during the ragebot's actual shots).",
+})
+
+detachBox:AddSlider("DetachedOffsetY", {
+    Text = "Handle Offset Y",
+    Default = 0,
+    Min = -20,
+    Max = 300,
+    Rounding = 0,
+    Suffix = " studs",
+    Tooltip = "Vertical offset added to target head position for the Handle. 0 = at target head (gun-near-victim look). Positive = above target (bullet-from-sky look). If shots stop registering, dial toward 0 — server-side origin distance check may reject wildly offset origins.",
+})
+
+detachBox:AddSlider("DetachedSpinRate", {
+    Text = "Handle Spin Rate",
+    Default = 5,
+    Min = 0,
+    Max = 20,
+    Rounding = 1,
+    Tooltip = "How fast the offset Handle spins on its own axes. 0 = static; higher = whirling gun visual. Cosmetic — doesn't affect hit registration.",
 })
 
 Toggles.Ragebot:OnChanged(function()
