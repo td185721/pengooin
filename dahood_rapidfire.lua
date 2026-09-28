@@ -2819,16 +2819,23 @@ local function buildIndicator()
         vis.dot = dot
 
         vis.conn = RunService.RenderStepped:Connect(function()
-            local c = lp.Character
-            local hd = c and c:FindFirstChild("Head")
-            if hd then
-                local sp, onScreen = camera:WorldToScreenPoint(hd.Position)
-                if onScreen and sp.Z > 0 then
-                    vis.dot.Position = UDim2.fromOffset(sp.X, sp.Y)
-                    vis.dot.Visible = true
-                else
-                    vis.dot.Visible = false
-                end
+            -- Point the dot at wherever the SERVER thinks we are:
+            --   fake pos active → the snapshot's seed pos (0, safeY, 0)
+            --   fake pos off    → our real character (server cache tracks local HRP naturally)
+            local worldPos
+            if state.fakePos and state.fakePos.active then
+                local safeY = (Options.FakePosY and Options.FakePosY.Value) or 1000000
+                worldPos = Vector3.new(0, safeY, 0)
+            else
+                local c = lp.Character
+                local hd = c and c:FindFirstChild("Head")
+                worldPos = hd and hd.Position
+            end
+            if not worldPos then vis.dot.Visible = false; return end
+            local sp, onScreen = camera:WorldToScreenPoint(worldPos)
+            if onScreen and sp.Z > 0 then
+                vis.dot.Position = UDim2.fromOffset(sp.X, sp.Y)
+                vis.dot.Visible = true
             else
                 vis.dot.Visible = false
             end
