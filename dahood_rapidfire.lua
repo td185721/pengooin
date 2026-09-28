@@ -1486,18 +1486,28 @@ end)
 
 -- ── Auto-Reset on Down ────────────────────────────────────────────────────
 -- Watch BodyEffects.K.O / Dead / SDeath + Humanoid.Died. On any flip, force
--- the character to reset by destroying its HumanoidRootPart. Optionally
--- capture HRP CFrame at down-time and teleport back on respawn.
+-- the character to reset via Humanoid:ChangeState(Dead). Optionally capture
+-- HRP CFrame at down-time and teleport back on respawn.
 --
--- Empirically verified 2026-09-28 against live Da Hood: neither Humanoid.Health
--- writes, Character:BreakJoints(), void-teleport (server yanks HRP back within
--- ~250ms), nor MainEvent:FireServer("ResetNew") work during the downed state.
--- The one path that isn't hooked is a raw :Destroy() on the HumanoidRootPart —
--- Da Hood's server-side detects the missing HRP and triggers its own respawn
--- flow, refilling the SAME Character Model instance with fresh parts + a
--- ForceField (spawn protection) inside ~2-3 seconds. Because the Model is
--- reused, lp.CharacterAdded doesn't fire on this reset — we detect completion
--- by polling for a fresh HRP + FULLY_LOADED_CHAR marker + K.O flag cleared.
+-- Empirically verified 2026-09-28 against live Da Hood:
+--   • Humanoid.Health = 0            → hooked, silently reverted.
+--   • Character:BreakJoints()        → hooked, no-op.
+--   • MainEvent("ResetNew")          → server rejects with "Unable to reset"
+--                                       toast during K.O.
+--   • Void teleport HRP.CFrame       → server yanks HRP back to safe ground
+--                                       within ~250ms; never falls past
+--                                       FallenPartsDestroyHeight.
+--   • HRP:Destroy()                  → client-side only; server doesn't
+--                                       detect and doesn't respawn.
+--   • Humanoid:ChangeState(Dead)     → WORKS. Direct engine state transition
+--                                       that Da Hood's hooks don't cover.
+--                                       Full respawn cycle in ~3.6s (Dead →
+--                                       Running with fresh ForceField).
+--
+-- Da Hood reuses the same Character Model instance across the reset (refills
+-- internally rather than swapping), so lp.CharacterAdded doesn't fire on this
+-- reset path. Detect completion by polling for fresh HRP + ForceField + K.O
+-- and Dead flags cleared.
 
 state.autoReset = {
     active = false,
@@ -1543,12 +1553,19 @@ local function doForceReset()
         state.autoReset.savedCF = hrp.CFrame
     end
 
-    -- The kill: raw :Destroy() on the HRP. Da Hood's downed-state hooks
-    -- catch Humanoid.Health writes / BreakJoints / ResetNew, but not this.
-    pcall(function() hrp:Destroy() end)
+    -- The kill: Humanoid:ChangeState(Dead). SetStateEnabled first in case a
+    -- prior script disabled the Dead state for K.O handling. This bypasses
+    -- every hook Da Hood ships on Health writes / BreakJoints / ResetNew.
+    pcall(function()
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if hum then
+            hum:SetStateEnabled(Enum.HumanoidStateType.Dead, true)
+            hum:ChangeState(Enum.HumanoidStateType.Dead)
+        end
+    end)
 
-    -- Poll for respawn: fresh HRP + FULLY_LOADED_CHAR marker + K.O cleared.
-    -- Runs on a separate thread so we don't block the caller.
+    -- Poll for respawn: fresh HRP + ForceField + K.O/Dead cleared. Runs on a
+    -- separate thread so we don't block the caller.
     if state.autoReset.respawnThread then
         pcall(task.cancel, state.autoReset.respawnThread)
     end
@@ -1559,13 +1576,13 @@ local function doForceReset()
             local c = lp.Character
             if c then
                 local newHRP = c:FindFirstChild("HumanoidRootPart")
-                local loaded = c:FindFirstChild("FULLY_LOADED_CHAR")
+                local ff = c:FindFirstChildOfClass("ForceField")
                 local be = c:FindFirstChild("BodyEffects")
                 local ko = be and be:FindFirstChild("K.O")
                 local dead = be and be:FindFirstChild("Dead")
                 local koFalse = not ko or not ko.Value
                 local deadFalse = not dead or not dead.Value
-                if newHRP and loaded and koFalse and deadFalse then
+                if newHRP and ff and koFalse and deadFalse then
                     if Toggles.AutoResetReturn and Toggles.AutoResetReturn.Value
                        and state.autoReset.savedCF then
                         newHRP.CFrame = state.autoReset.savedCF
