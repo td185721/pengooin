@@ -255,6 +255,7 @@ local Window = Library:CreateWindow({
 local Tabs = {
     Combat = Window:AddTab("Combat"),
     Movement = Window:AddTab("Movement"),
+    Player = Window:AddTab("Player"),
     Buy = Window:AddTab("Buy"),
     Ragebot = Window:AddTab("Ragebot"),
     Visuals = Window:AddTab("Visuals"),
@@ -1454,7 +1455,7 @@ local function startAutoArmor()
     end)
 end
 
-local autoBox = Tabs.Ragebot:AddRightGroupbox("Auto Buy")
+local autoBox = Tabs.Player:AddLeftGroupbox("Auto Buy Armor")
 
 autoBox:AddToggle("AutoBuyArmor", {
     Text = "Auto Buy Armor",
@@ -1481,6 +1482,132 @@ autoBox:AddSlider("AutoArmorThreshold", {
 
 Toggles.AutoBuyArmor:OnChanged(function()
     if Toggles.AutoBuyArmor.Value then startAutoArmor() else stopAutoArmor() end
+end)
+
+-- ── Auto-Reset on Down ────────────────────────────────────────────────────
+-- Watch BodyEffects.K.O / Dead / SDeath + Humanoid.Died. On any flip, force
+-- the character to reset via Humanoid.Health = 0 + BreakJoints so we skip the
+-- bleedout / getting-stomped window entirely. Optionally capture HRP CFrame
+-- at the moment of the down and, on respawn, teleport back to that spot.
+
+state.autoReset = {
+    active = false,
+    charConn = nil,
+    watchConns = {},
+    savedCF = nil,
+    resetting = false,
+}
+
+local resetBox = Tabs.Player:AddRightGroupbox("Auto Reset")
+
+resetBox:AddToggle("AutoReset", {
+    Text = "Auto Reset on Down",
+    Default = false,
+    Tooltip = "Force-reset your character the moment BodyEffects.K.O or Dead flips true. Skips the bleedout window and the getting-stomped window entirely.",
+})
+
+resetBox:AddToggle("AutoResetReturn", {
+    Text = "Return to Death Position",
+    Default = false,
+    Tooltip = "On respawn, teleport back to the exact HRP CFrame you had at the moment the down was detected.",
+})
+
+local function clearResetWatch()
+    for _, c in state.autoReset.watchConns do
+        pcall(function() c:Disconnect() end)
+    end
+    table.clear(state.autoReset.watchConns)
+end
+
+local function doForceReset()
+    if state.autoReset.resetting then return end
+    state.autoReset.resetting = true
+    local char = lp.Character
+    if not char then state.autoReset.resetting = false; return end
+    if Toggles.AutoResetReturn and Toggles.AutoResetReturn.Value then
+        local hrp = char:FindFirstChild("HumanoidRootPart")
+        if hrp then state.autoReset.savedCF = hrp.CFrame end
+    end
+    -- Health = 0 flips the Died signal on the client Humanoid; BreakJoints is
+    -- the belt-and-suspenders in case Da Hood's replicated humanoid ignores
+    -- the direct health write. Either path lands the reset within one frame.
+    pcall(function()
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if hum then hum.Health = 0 end
+        char:BreakJoints()
+    end)
+end
+
+local function watchDownState(char)
+    clearResetWatch()
+    if not char then return end
+
+    local function checkVal(v)
+        if not state.autoReset.active then return end
+        if v and v.Value then doForceReset() end
+    end
+
+    local function bindBodyEffects(be)
+        for _, name in {"K.O", "Dead", "SDeath"} do
+            local val = be:FindFirstChild(name)
+            if val and val:IsA("ValueBase") then
+                table.insert(state.autoReset.watchConns,
+                    val:GetPropertyChangedSignal("Value"):Connect(function() checkVal(val) end))
+                checkVal(val)                                 -- catch already-true at bind time
+            end
+        end
+    end
+
+    local be = char:FindFirstChild("BodyEffects")
+    if be then
+        bindBodyEffects(be)
+    else
+        table.insert(state.autoReset.watchConns, char.ChildAdded:Connect(function(c)
+            if c.Name == "BodyEffects" then bindBodyEffects(c) end
+        end))
+    end
+
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if hum then
+        table.insert(state.autoReset.watchConns, hum.Died:Connect(function()
+            if state.autoReset.active then doForceReset() end
+        end))
+    end
+end
+
+local function stopAutoReset()
+    state.autoReset.active = false
+    clearResetWatch()
+    if state.autoReset.charConn then
+        state.autoReset.charConn:Disconnect()
+        state.autoReset.charConn = nil
+    end
+    state.autoReset.resetting = false
+    state.autoReset.savedCF = nil
+end
+
+local function startAutoReset()
+    stopAutoReset()
+    state.autoReset.active = true
+    if lp.Character then watchDownState(lp.Character) end
+    state.autoReset.charConn = lp.CharacterAdded:Connect(function(char)
+        char:WaitForChild("HumanoidRootPart", 5)
+        task.wait(0.3)
+        if Toggles.AutoResetReturn and Toggles.AutoResetReturn.Value and state.autoReset.savedCF then
+            local hrp = char:FindFirstChild("HumanoidRootPart")
+            if hrp then
+                hrp.CFrame = state.autoReset.savedCF
+                hrp.AssemblyLinearVelocity = Vector3.zero
+            end
+            state.autoReset.savedCF = nil
+        end
+        state.autoReset.resetting = false
+        watchDownState(char)
+    end)
+end
+
+Toggles.AutoReset:OnChanged(function()
+    if Toggles.AutoReset.Value then startAutoReset() else stopAutoReset() end
 end)
 
 -- ── Combat Tab ────────────────────────────────────────────────────────────
@@ -1965,7 +2092,7 @@ end
 
 -- Server Position Indicator
 
-local visBox = Tabs.Ragebot:AddLeftGroupbox("Server Position Indicator")
+local visBox = Tabs.Visuals:AddRightGroupbox("Server Position Indicator")
 
 visBox:AddToggle("Indicator", {
     Text = "Show Server Position",
@@ -2448,6 +2575,7 @@ local function hardCleanup()
     pcall(rbStop)
     pcall(rbShow)
     pcall(stopAutoArmor)
+    pcall(stopAutoReset)
     pcall(stopAimbot)
     pcall(stopTriggerbot)
     pcall(destroyFOV)
