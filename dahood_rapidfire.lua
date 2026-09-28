@@ -1347,8 +1347,9 @@ end
 
 rageBox:AddDropdown("RagebotTargets", {
     Values = {},
-    Default = nil,
+    Default = {},
     Multi = true,
+    AllowNull = true,                                                 -- Linoria asserts AllowNull or Default; both set explicitly
     Text = "Target Players",
     Tooltip = "Pick one or more players. Ragebot rotates: kill target → stomp → move to next → repeat. List refreshes when players join/leave.",
 })
