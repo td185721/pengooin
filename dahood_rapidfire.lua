@@ -1294,6 +1294,12 @@ local function rbDetachedShoot(target)
     local offsetY = (Options.DetachedOffsetY and Options.DetachedOffsetY.Value) or 0
     local spinRate = (Options.DetachedSpinRate and Options.DetachedSpinRate.Value) or 5
 
+    -- Save local HRP position so we can restore after fpReseedInline yanks
+    -- us to safeY (fake-pos active case) — Detached mode is supposed to
+    -- leave the character stationary at dj's chosen spot.
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    local savedHrpCF = hrp and hrp.CFrame
+
     -- Bypass fake-position rewrite for the duration of this fire cycle so
     -- the server's origin check sees our real HRP position (not the spoof).
     state.fakePos.fireBypass = true
@@ -1350,6 +1356,14 @@ local function rbDetachedShoot(target)
     -- re-engages (see fpReseedInline note).
     fpReseedInline()
     state.fakePos.fireBypass = false
+
+    -- Restore local character to where dj had them before the fire cycle
+    -- (fpReseedInline teleported to safeY; the teleport-back is blocked by
+    -- our hook now that bypass is off — server keeps thinking we're at safe).
+    if hrp and savedHrpCF and hrp.Parent then
+        hrp.CFrame = savedHrpCF
+        hrp.AssemblyLinearVelocity = Vector3.zero
+    end
 end
 
 local function rbStompCycle(target)
@@ -1990,12 +2004,14 @@ fpReseedInline = function()
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
     if not hrp then return end
     local safeY = (Options.FakePosY and Options.FakePosY.Value) or 1000000
-    hrp.CFrame = CFrame.new(0, safeY, 0)
-    hrp.AssemblyLinearVelocity = Vector3.zero
-    -- Two heartbeats: one for the write to fire a dirty-position packet,
-    -- one for physics replication to settle before caller flips bypass=false.
-    RunService.Heartbeat:Wait()
-    RunService.Heartbeat:Wait()
+    -- Nudge with 1-stud writes so at least one physics packet definitely
+    -- fires with safe-pos bytes (a single teleport-and-wait can miss the
+    -- physics tick window at the ~15Hz replication rate).
+    for i = 1, 3 do
+        hrp.CFrame = CFrame.new(i * 1.0, safeY, 0)
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        RunService.Heartbeat:Wait()
+    end
 end
 
 -- Desync visualizer: a floating billboard at the fake-pos location, visible
