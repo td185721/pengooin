@@ -545,9 +545,10 @@ end
 -- Capture a physics-161 snapshot at a shop item's pad position so the
 -- server can be briefly told "we're at that pad" via snapshot swap during
 -- a buy — no local HRP teleport, no visible yank once cached. The initial
--- capture DOES teleport local HRP briefly (hidden under hideCharacter),
--- but only the first time we buy that specific item; the result is cached
--- in state.fakePos.shopSnapshots so every subsequent buy is fully seamless.
+-- capture DOES teleport local HRP for ~50ms with no character-hide, so dj
+-- sees a brief flicker to the pad and back the first time each item is
+-- bought; every subsequent buy of that item is fully seamless (cached in
+-- state.fakePos.shopSnapshots).
 local function fpCaptureShopSnapshot(item)
     if not state.fakePos.active then return nil end
     local char = lp.Character
@@ -558,33 +559,31 @@ local function fpCaptureShopSnapshot(item)
 
     local origCF = hrp.CFrame
     local anchor = CFrame.new(target.Position + Vector3.new(-2, 3, 0))
-    local restores = hideCharacter(char)
 
-    -- Bypass replay so real physics packets carry the shop-anchor position
-    state.fakePos.fireBypass = true
-    hrp.CFrame = anchor
-    hrp.AssemblyLinearVelocity = Vector3.zero
-    RunService.Heartbeat:Wait()
-
+    -- Install capture hook FIRST so we don't miss the very first packet.
     local captured
     local h = function(p)
         if captured then return end
         if p.PacketId == 161 and p.Size >= 40 then captured = p.AsArray end
     end
     raknet.add_send_hook(h)
-    for i = 1, 4 do
-        hrp.CFrame = anchor * CFrame.new(i * 0.5, 0, 0)
-        hrp.AssemblyLinearVelocity = Vector3.zero
+
+    -- Bypass replay so real physics packets carry the shop-anchor position.
+    -- Character stays visible — this is a brief real teleport, ~50ms.
+    state.fakePos.fireBypass = true
+    hrp.CFrame = anchor
+    hrp.AssemblyLinearVelocity = Vector3.zero
+
+    -- Wait up to 3 heartbeats (~50ms) for physics to emit a full 161 at the pad.
+    local t = tick(); while not captured and tick() - t < 0.15 do
         RunService.Heartbeat:Wait()
     end
-    local t = tick(); while not captured and tick() - t < 0.4 do task.wait(0.03) end
     raknet.remove_send_hook(h)
 
+    -- Restore local position, snap server back to safe via replay nudge.
     hrp.CFrame = origCF
     hrp.AssemblyLinearVelocity = Vector3.zero
-    -- fpReseedInline flips fireBypass=false and snaps server back to safe via replay nudge
-    fpReseedInline()
-    restoreCharacter(restores)
+    fpReseedInline()  -- sets fireBypass=false internally
     return captured
 end
 
