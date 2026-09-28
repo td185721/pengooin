@@ -2806,7 +2806,16 @@ _G.pengooin_HookVersion = "2026-09-24-no-wall-bypass-manual"
 --      Normal override), optional Magic Bullet (force Head as reported hit).
 -- Only one path runs per shot; ragebot wins when both are enabled.
 do
-    local origShoot = GunHandler.shoot
+    -- Save the original GunHandler.shoot to _G so hardCleanup can restore it
+    -- on Unload — and so a re-execute (without full script teardown) doesn't
+    -- accidentally save a stale wrapper as "the original" and permanently
+    -- lock in the previous wrapper.  Without this restore, silent-aim keeps
+    -- firing after Unload because Toggles.SilentAim.Value survives
+    -- Library:Unload and the wrapper is still installed.
+    if not _G.__pengooin_origShoot then
+        _G.__pengooin_origShoot = GunHandler.shoot
+    end
+    local origShoot = _G.__pengooin_origShoot
     GunHandler.shoot = function(args)
         if args and typeof(args) == "table" then
             local ragebotOn = Toggles.Ragebot and Toggles.Ragebot.Value
@@ -3382,6 +3391,14 @@ local function hardCleanup()
     pcall(destroyIndicator)
     pcall(espStop)
     pcall(spyStop)
+    -- Restore GunHandler.shoot so silent-aim / ragebot / bullet-manip wrappers
+    -- don't keep firing after unload. Toggles table survives Library:Unload,
+    -- so without restoring, the wrapper would still read stale toggle state.
+    -- Keep _G.__pengooin_origShoot around for the next execute — losing it
+    -- would let a fresh load save the (still-current) wrapper as "original".
+    if _G.__pengooin_origShoot then
+        pcall(function() GunHandler.shoot = _G.__pengooin_origShoot end)
+    end
     -- second sweep on next frame to catch anything a Toggle:OnChanged
     -- callback rebuilt during Unload's teardown.
     task.defer(function()
