@@ -1625,10 +1625,10 @@ strafeBox:AddSlider("RagebotStrafeX", {
 strafeBox:AddSlider("RagebotStrafeY", {
     Text = "Y Distance",
     Default = 0,
-    Min = -30,
-    Max = 30,
+    Min = -15,
+    Max = 15,
     Rounding = 1,
-    Tooltip = "Vertical offset from target's HRP. Negative sinks us under the floor — invisible to enemies while shots still register.",
+    Tooltip = "Vertical offset from target's HRP. Negative sinks us under the floor — invisible to enemies while shots still register. Capped at ±15: beyond ~±20 the server-side raycast from origin to head starts catching the floor/ceiling and the shot fails.",
 })
 
 strafeBox:AddSlider("RagebotStrafeStep", {
