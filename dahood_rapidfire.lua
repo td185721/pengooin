@@ -54,8 +54,7 @@ local state = {
         renderBind = nil,
         clone = nil,
         targetIdx = 1,                                        -- rotation index into RagebotTargets multi-select
-        orbitAngle = 0,                                       -- continuous orbit angle around current target (radians)
-        orbitLastTick = 0,                                    -- tick() of last orbit advance — used for dt-based angular velocity
+        strafeAngle = 0,                                      -- current angle around target (radians), advanced per teleport
     },
     autoArmor = {
         active = false,
@@ -885,37 +884,32 @@ local function randomParkPos(target)
     )
 end
 
--- Orbit config accessors — defaults kick in before the GUI sliders are built
--- (also protects against Options.* being nil during startup).
-local function orbitRadius()
-    return (Options.RagebotOrbitRadius and Options.RagebotOrbitRadius.Value) or 8
+-- Strafe config accessors — defaults kick in before the GUI sliders exist
+-- (protects against Options.* being nil during startup).
+local function strafeXDist()
+    return (Options.RagebotStrafeX and Options.RagebotStrafeX.Value) or 8
 end
-local function orbitHeight()
-    return (Options.RagebotOrbitHeight and Options.RagebotOrbitHeight.Value) or 0
+local function strafeYDist()
+    return (Options.RagebotStrafeY and Options.RagebotStrafeY.Value) or 0
 end
-local function orbitSpeed()
-    return (Options.RagebotOrbitSpeed and Options.RagebotOrbitSpeed.Value) or 3
-end
-
--- Advance state.ragebot.orbitAngle by (speed * dt). Returns the new angle.
--- Time-based (not per-frame constant) so orbit speed is framerate-independent.
-local function advanceOrbitAngle()
-    local now = tick()
-    local last = state.ragebot.orbitLastTick
-    local dt = (last > 0) and math.min(now - last, 0.1) or 0
-    state.ragebot.orbitLastTick = now
-    state.ragebot.orbitAngle = (state.ragebot.orbitAngle or 0) + orbitSpeed() * dt
-    return state.ragebot.orbitAngle
+local function strafeStep()
+    -- Slider is in degrees; convert here so the per-teleport advance is radians.
+    return math.rad((Options.RagebotStrafeStep and Options.RagebotStrafeStep.Value) or 137.5)
 end
 
--- Build the world-space orbit position for `target` at the given angle.
--- Height is a straight Y offset from the target's HRP — negative sinks us
--- under the floor for stealth. Returns nil if the target's HRP is gone.
-local function orbitPosAt(target, angle)
-    local tHRP = targetHRP(target)
-    if not tHRP then return nil end
-    local r = orbitRadius()
-    return tHRP.Position + Vector3.new(math.cos(angle) * r, orbitHeight(), math.sin(angle) * r)
+-- Advance strafe angle by the configured step and return the new angle,
+-- with a small random jitter so we don't land on the exact same 3-4 spots
+-- every rotation if the user picked a step that divides 2π evenly.
+local function nextStrafeAngle()
+    state.ragebot.strafeAngle = (state.ragebot.strafeAngle or math.random() * math.pi * 2) + strafeStep()
+    return state.ragebot.strafeAngle + (math.random() - 0.5) * 0.2
+end
+
+-- World-space strafe offset at the current angle, using the X/Y sliders.
+-- Y is a straight vertical offset — negative sinks us under the floor.
+local function strafeOffsetAt(angle)
+    local x = strafeXDist()
+    return Vector3.new(math.cos(angle) * x, strafeYDist(), math.sin(angle) * x)
 end
 
 -- Multi-target rotation. Options.RagebotTargets is a Multi dropdown whose
@@ -1285,27 +1279,6 @@ end
 -- forward local so the Fake Position section can assign into it.
 local fpReseedInline
 
--- Orbit-hold: keep the character on the orbit path for `frames` heartbeats,
--- advancing the angle by (speed * dt) each frame and facing the target so the
--- gun aims cleanly. Used between fire cycles when a target is present — the
--- character is continuously moving on the orbit instead of teleport-parking.
-local function rbOrbitHold(target, frames)
-    for _ = 1, frames do
-        if not state.ragebot.active then break end
-        local hrp = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
-        local tHRP = targetHRP(target)
-        if hrp and hrp.Parent and tHRP then
-            local angle = advanceOrbitAngle()
-            local pos = orbitPosAt(target, angle)
-            if pos then
-                hrp.CFrame = CFrame.new(pos, tHRP.Position)
-                hrp.AssemblyLinearVelocity = Vector3.zero
-            end
-        end
-        RunService.Heartbeat:Wait()
-    end
-end
-
 local function rbStrafeShoot(target)
     if not selfAlive() then return end
     local char = lp.Character
@@ -1320,25 +1293,30 @@ local function rbStrafeShoot(target)
     local tHRP = targetHRP(target)
     if not tHRP then return end
 
-    -- Advance orbit + place HRP at the current orbit position, facing target.
-    -- Do this 3 heartbeats in a row so the position is stable long enough for
-    -- the server to accept it before the ShootGun range check runs.
+    -- Pick next strafe angle, compute world position from the X/Y sliders,
+    -- teleport there facing the target so the gun aims cleanly.
+    local angle = nextStrafeAngle()
+    local strafePos = tHRP.Position + strafeOffsetAt(angle)
+
+    hrp.CFrame = CFrame.new(strafePos, tHRP.Position)
+    hrp.AssemblyLinearVelocity = Vector3.zero
+
+    -- 3 heartbeats (~50ms) so the new position replicates to the server
+    -- before its ShootGun range check runs on the outgoing packet.
     for _ = 1, 3 do
         if not state.ragebot.active then return end
-        local angle = advanceOrbitAngle()
-        local pos = orbitPosAt(target, angle)
-        local currentTHRP = targetHRP(target)
-        if pos and currentTHRP then
-            hrp.CFrame = CFrame.new(pos, currentTHRP.Position)
-            hrp.AssemblyLinearVelocity = Vector3.zero
-        end
         RunService.Heartbeat:Wait()
     end
+    hrp.CFrame = CFrame.new(strafePos, tHRP.Position)
+    hrp.AssemblyLinearVelocity = Vector3.zero
 
     for _, tool in guns do
         if not state.ragebot.active then break end
         fireOneGun(tool, target, char)
     end
+
+    RunService.Heartbeat:Wait()
+    rbParkVoid()
 end
 
 -- ragdoll can leave HRP floating at the old alive position while the visible
@@ -1409,9 +1387,6 @@ local function rbLoop()
     rbUpdateSpectate()
     rbParkVoid()
     rbHoldVoid(3)
-    -- Reset orbit clock so first advance uses dt=0 (no huge jump if a prior
-    -- session left state.ragebot.orbitLastTick stale).
-    state.ragebot.orbitLastTick = 0
 
     while state.ragebot.active do
         -- Death guard: if we're dead / mid-respawn, wait for humanoid to come
@@ -1428,34 +1403,32 @@ local function rbLoop()
         if not target or not target.Parent then
             if #getSelectedTargetNames() > 0 then advanceTarget() end
             rbHoldVoid(6)
-            state.ragebot.orbitLastTick = 0                       -- restart dt clock when we re-acquire
             continue
         end
 
         if not targetAlive(target) then
             advanceTarget()
             rbHoldVoid(4)
-            state.ragebot.orbitLastTick = 0
             continue
         end
 
         if shouldSkipTarget(target) then
-            rbOrbitHold(target, 6)                                -- orbit while spawn-protection ticks down
+            rbHoldVoid(6)
             continue
         end
 
         if targetDowned(target) and Toggles.RagebotAutoStomp.Value then
             rbStompCycle(target)
             advanceTarget()
+            rbParkVoid()
             rbHoldVoid(4)
-            state.ragebot.orbitLastTick = 0
             continue
         end
 
         rbStrafeShoot(target)
 
         local waitFrames = math.max(1, math.floor(Options.RagebotDelay.Value * 60))
-        rbOrbitHold(target, waitFrames)
+        rbHoldVoid(waitFrames)
     end
 end
 
@@ -1575,19 +1548,19 @@ runBox:AddSlider("RagebotDelay", {
     Tooltip = "Seconds between shot bursts",
 })
 
-local orbitBox = Tabs.Ragebot:AddRightGroupbox("Orbit")
+local strafeBox = Tabs.Ragebot:AddRightGroupbox("Strafe")
 
-orbitBox:AddSlider("RagebotOrbitRadius", {
-    Text = "Radius (X)",
+strafeBox:AddSlider("RagebotStrafeX", {
+    Text = "X Distance",
     Default = 8,
     Min = 3,
     Max = 40,
     Rounding = 1,
-    Tooltip = "Horizontal distance from target — server's ShootGun range check needs us under tool.Range studs (~250).",
+    Tooltip = "Horizontal distance from target. Server's ShootGun range check needs us under tool.Range studs (~250).",
 })
 
-orbitBox:AddSlider("RagebotOrbitHeight", {
-    Text = "Height (Y)",
+strafeBox:AddSlider("RagebotStrafeY", {
+    Text = "Y Distance",
     Default = 0,
     Min = -30,
     Max = 30,
@@ -1595,13 +1568,13 @@ orbitBox:AddSlider("RagebotOrbitHeight", {
     Tooltip = "Vertical offset from target's HRP. Negative sinks us under the floor — invisible to enemies while shots still register.",
 })
 
-orbitBox:AddSlider("RagebotOrbitSpeed", {
-    Text = "Orbit Speed",
-    Default = 3,
-    Min = 0,
-    Max = 8,
-    Rounding = 2,
-    Tooltip = "Angular velocity in radians/sec around the target. 0 = park at current angle, ~6 = fast strafe.",
+strafeBox:AddSlider("RagebotStrafeStep", {
+    Text = "Strafe Speed",
+    Default = 137.5,
+    Min = 5,
+    Max = 360,
+    Rounding = 1,
+    Tooltip = "Degrees the strafe angle advances per teleport. 137.5° (golden angle) gives even coverage without repeating spots. Higher = wider spacing between teleports.",
 })
 
 Toggles.Ragebot:OnChanged(function()
