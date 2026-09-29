@@ -906,9 +906,26 @@ local function nextStrafeAngle()
     return state.ragebot.strafeAngle + (math.random() - 0.5) * 0.2
 end
 
--- World-space strafe offset at the current angle, using the X/Y sliders.
--- Y is a straight vertical offset — negative sinks us under the floor.
+-- Slider caps used by random-strafe mode. Match the slider Max values in
+-- the GUI section so we never pick a position that lands in the dead zone
+-- past the server-side line-of-sight raycast cliff.
+local RAND_X_CAP = 20
+local RAND_Y_CAP = 15
+
+-- World-space strafe offset. Two modes:
+--   - Deterministic (default): angle around target at X-slider radius,
+--     Y-slider height. Predictable arc.
+--   - Random (RagebotRandomStrafe toggle): each axis picks independently
+--     in [-CAP, +CAP], full 3D chaos within the working zone. Angle input
+--     is ignored.
 local function strafeOffsetAt(angle)
+    if Toggles.RagebotRandomStrafe and Toggles.RagebotRandomStrafe.Value then
+        return Vector3.new(
+            (math.random() * 2 - 1) * RAND_X_CAP,
+            (math.random() * 2 - 1) * RAND_Y_CAP,
+            (math.random() * 2 - 1) * RAND_X_CAP
+        )
+    end
     local x = strafeXDist()
     return Vector3.new(math.cos(angle) * x, strafeYDist(), math.sin(angle) * x)
 end
@@ -1354,24 +1371,25 @@ local function rbStrafeShoot(target)
     local tHRP = targetHRP(target)
     if not tHRP then return end
 
-    -- Pick next strafe angle, compute world position from the X/Y sliders,
-    -- teleport there facing the target so the gun aims cleanly.
+    -- Pick next strafe angle, snapshot the offset ONCE (random mode picks
+    -- a fresh 3D position per call, so freezing it here keeps the HRP stable
+    -- through the 3-heartbeat settle and the fire itself), teleport facing
+    -- the target so the gun aims cleanly.
     local angle = nextStrafeAngle()
-    local strafePos = tHRP.Position + strafeOffsetAt(angle)
+    local offset = strafeOffsetAt(angle)
 
-    hrp.CFrame = CFrame.new(strafePos, tHRP.Position)
+    hrp.CFrame = CFrame.new(tHRP.Position + offset, tHRP.Position)
     hrp.AssemblyLinearVelocity = Vector3.zero
 
-    -- 3 heartbeats (~50ms) so the new position replicates to the server
-    -- before its ShootGun range check runs on the outgoing packet.
-    -- Rewrite each frame so gravity/humanoid physics can't drift us off
-    -- (especially critical when Y is negative — under-floor collisions
-    -- and Falling state both try to push us back up).
+    -- 3 heartbeats (~50ms) so the position replicates to the server before
+    -- its ShootGun range check runs. Rewrite each frame so gravity/humanoid
+    -- physics can't drift us off — critical when Y is negative (under-floor
+    -- collisions and Falling state both try to push us back up).
     for _ = 1, 3 do
         if not state.ragebot.active then return end
         local currentTHRP = targetHRP(target)
         if currentTHRP then
-            hrp.CFrame = CFrame.new(currentTHRP.Position + strafeOffsetAt(angle), currentTHRP.Position)
+            hrp.CFrame = CFrame.new(currentTHRP.Position + offset, currentTHRP.Position)
             hrp.AssemblyLinearVelocity = Vector3.zero
         end
         RunService.Heartbeat:Wait()
@@ -1638,6 +1656,12 @@ strafeBox:AddSlider("RagebotStrafeStep", {
     Max = 360,
     Rounding = 1,
     Tooltip = "Degrees the strafe angle advances per teleport. 137.5° (golden angle) gives even coverage without repeating spots. Higher = wider spacing between teleports.",
+})
+
+strafeBox:AddToggle("RagebotRandomStrafe", {
+    Text = "Random Strafe",
+    Default = false,
+    Tooltip = "Ignore the X/Y sliders and pick a fresh random 3D position each teleport within the ±20 X/Z and ±15 Y working range. Full chaos — impossible for enemies to predict where the next shot comes from.",
 })
 
 Toggles.Ragebot:OnChanged(function()
