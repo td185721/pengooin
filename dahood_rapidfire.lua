@@ -1288,6 +1288,11 @@ local function rbStrafeShoot(target)
     local dist = 6 + math.random() * 8
     local strafePos = tHRP.Position + strafeOffsetAt(angle, dist)
 
+    -- Under fake pos: save dj's current position (Y=1M) so we can snap them
+    -- back local after the fire cycle. Otherwise HRP stays at strafePos after
+    -- the fire, dj is stranded at ground level instead of the fake-pos anchor.
+    local origCF = state.fakePos.active and hrp.CFrame or nil
+
     -- Bypass fake-position rewrite for the strafe→fire→park round trip so
     -- real physics packets carry our actual strafe HRP position (server's
     -- origin check needs to see us near the target for the shot to register).
@@ -1321,6 +1326,14 @@ local function rbStrafeShoot(target)
     if not state.fakePos.active then
         RunService.Heartbeat:Wait()
         rbParkVoid()
+    end
+
+    -- Under fake pos, restore local HRP to dj's pre-fire position (Y=1M) so
+    -- they don't stay stranded at strafePos between fires. Do this BEFORE
+    -- fpReseedInline so the reseed nudge fires from the safe pos.
+    if origCF and hrp.Parent then
+        hrp.CFrame = origCF
+        hrp.AssemblyLinearVelocity = Vector3.zero
     end
 
     -- Snap server cache back to safe pos via replay nudge, then release bypass.
@@ -1505,6 +1518,7 @@ local function rbStompCycle(target)
     -- this loop exits immediately after the killing stomp registers.
     -- Stomp validation reads server-cached HRP; bypass fake-position so the
     -- real "on-corpse" packet flies during this whole cycle.
+    local origCF = state.fakePos.active and hrp.CFrame or nil
     state.fakePos.fireBypass = true
 
     local deadline = tick() + 2
@@ -1516,6 +1530,12 @@ local function rbStompCycle(target)
         hrp.AssemblyLinearVelocity = Vector3.zero
         pcall(function() MainEvent:FireServer("Stomp") end)
         RunService.Heartbeat:Wait()
+    end
+
+    -- Under fake pos: restore local HRP to dj's Y=1M anchor before reseeding.
+    if origCF and hrp.Parent then
+        hrp.CFrame = origCF
+        hrp.AssemblyLinearVelocity = Vector3.zero
     end
 
     -- Re-seed safe pos before releasing fire-bypass.
@@ -1540,8 +1560,14 @@ local function rbUpdateSpectate()
     end
 end
 
+-- Detached Handle mode removed 2026-09-29 — dj confirmed the concept doesn't
+-- work in DH (server-side ShootGun handler validates HRP position, not the
+-- weapon Handle's Muzzle position, so offsetting the Handle alone never
+-- passed origin check regardless of tuning). Function stub kept so the rbLoop
+-- dispatch below doesn't need to be surgery'd; always returns false so every
+-- fire routes through rbStrafeShoot.
 local function isDetached()
-    return Toggles.DetachedFire and Toggles.DetachedFire.Value
+    return false
 end
 
 -- Wait helper that DOESN'T teleport us — used between shot cycles when in
@@ -1736,32 +1762,7 @@ runBox:AddSlider("RagebotDelay", {
     Tooltip = "Seconds between shot bursts from void",
 })
 
-local detachBox = Tabs.Ragebot:AddRightGroupbox("Detached Handle")
-
-detachBox:AddToggle("DetachedFire", {
-    Text = "Detached Handle Mode",
-    Default = false,
-    Tooltip = "Alternate fire mode. Character stays in place — the gun's Handle briefly offsets to the target via Motor6D.C0 for each shot, then snaps back to your hand. Target sees the gun near them with the bullet originating from there. Bypasses the strafe teleport entirely. Manual fire outside a ragebot burst is unaffected (Handle is only offset during the ragebot's actual shots).",
-})
-
-detachBox:AddSlider("DetachedOffsetY", {
-    Text = "Handle Offset Y",
-    Default = 0,
-    Min = -20,
-    Max = 300,
-    Rounding = 0,
-    Suffix = " studs",
-    Tooltip = "Vertical offset added to target head position for the Handle. 0 = at target head (gun-near-victim look). Positive = above target (bullet-from-sky look). If shots stop registering, dial toward 0 — server-side origin distance check may reject wildly offset origins.",
-})
-
-detachBox:AddSlider("DetachedSpinRate", {
-    Text = "Handle Spin Rate",
-    Default = 5,
-    Min = 0,
-    Max = 20,
-    Rounding = 1,
-    Tooltip = "How fast the offset Handle spins on its own axes. 0 = static; higher = whirling gun visual. Cosmetic — doesn't affect hit registration.",
-})
+-- Detached Handle groupbox removed 2026-09-29 — see isDetached() note.
 
 Toggles.Ragebot:OnChanged(function()
     if Toggles.Ragebot.Value then rbStart() else rbStop() end
