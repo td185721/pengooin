@@ -1118,7 +1118,11 @@ end
 
 -- Park: pick a plausible spot, teleport there with a randomized facing so
 -- our HRP rotation isn't identical every cycle (another cheap tell).
+-- Under fake pos snapshot mode this is a no-op — the replay hook keeps
+-- server at Y=1M regardless of local HRP, so parking local body serves
+-- nothing except yanking dj visibly.
 local function rbParkVoid()
+    if state.fakePos.active then return end
     local hrp = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
     if not hrp then return end
     local pos = randomParkPos(getTargetPlayer())
@@ -1133,7 +1137,17 @@ end
 -- always re-parks the moment we detect we've slid outside the plausible-Y
 -- band (which would happen if physics started applying — e.g. gravity while
 -- at a rooftop-tier Y).
+-- Under fake pos snapshot mode this collapses to a plain heartbeat wait: the
+-- replay hook already tells server we're at Y=1M, so parking local HRP in
+-- void just yanks dj's body around for nothing. Server sees safe pos regardless.
 local function rbHoldVoid(frames)
+    if state.fakePos.active then
+        for _ = 1, frames do
+            if not state.ragebot.active then break end
+            RunService.Heartbeat:Wait()
+        end
+        return
+    end
     local reparkCountdown = math.random(30, 45)
     for i = 1, frames do
         if not state.ragebot.active then break end
@@ -1282,9 +1296,12 @@ local function rbStrafeShoot(target)
     hrp.CFrame = CFrame.new(strafePos, tHRP.Position)
     hrp.AssemblyLinearVelocity = Vector3.zero
 
-    -- physics replication is ~30Hz — 3 heartbeats (~50ms) is the minimum
-    -- window before the server accepts a Shoot RPC with a matching origin.
-    for _ = 1, 3 do
+    -- physics replication is ~30Hz — 2 heartbeats (~33ms) is enough for
+    -- server to accept a Shoot RPC with matching origin under snapshot mode
+    -- (was 3 under Block mode). Every ms shaved here is one ms less that
+    -- enemies see us at the strafe position.
+    local waitFrames = state.fakePos.active and 2 or 3
+    for _ = 1, waitFrames do
         if not state.ragebot.active then state.fakePos.fireBypass = false; return end
         RunService.Heartbeat:Wait()
     end
@@ -1296,12 +1313,17 @@ local function rbStrafeShoot(target)
         fireOneGun(tool, target, char)
     end
 
-    RunService.Heartbeat:Wait()
-    rbParkVoid()
+    -- Skip rbParkVoid under snapshot mode: releasing fireBypass triggers the
+    -- replay hook to overlay safe-pos snapshot on the next 161, so server
+    -- cache snaps straight to Y=1M without needing a local void teleport.
+    -- Under Block mode the void park is still required (cache stays where
+    -- HRP is when Block re-engages).
+    if not state.fakePos.active then
+        RunService.Heartbeat:Wait()
+        rbParkVoid()
+    end
 
-    -- Before releasing fire-bypass, re-seed the server's cache back to the
-    -- safe fake-pos. Otherwise cache stays at strafe/void pos and enemies
-    -- can attack us there in the between-cycles window.
+    -- Snap server cache back to safe pos via replay nudge, then release bypass.
     fpReseedInline()
     state.fakePos.fireBypass = false
 end
