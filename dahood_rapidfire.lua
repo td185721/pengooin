@@ -1277,35 +1277,34 @@ local function fireOneGun(tool, target, char)
         local tHead = targetHead(target)
         if not tHead then break end
 
-        local muzzlePos
-        local def = tool:FindFirstChild("Default")
-        if def and def:FindFirstChild("Mesh") and def.Mesh:FindFirstChild("Muzzle") then
-            muzzlePos = def.Mesh.Muzzle.WorldPosition
-        else
-            muzzlePos = handle.Position
-        end
-
-        -- Force the hit to target.Head. GunHandler.shoot's Hit branch skips
-        -- its raycast when Hit is provided, so an under-floor shot doesn't
-        -- ray into the floor and come back with hit=map-geometry (server
-        -- reads the hit param for damage — if it's a wall, no damage).
-        -- HRP-vs-origin check still needs muzzle near HRP; that's satisfied
-        -- by holding at the strafe offset (X/Y sliders) close to target.
+        -- Origin sits 3 studs below the target's head, NOT at handle.Position.
+        -- Two reasons: (1) under-floor shots — handle is under the floor with
+        -- our body, so a server-side raycast from handle toward target.Head
+        -- crosses the floor and hits it first; (2) even above-floor, this
+        -- guarantees a clear line-of-sight ray from origin to head so no
+        -- prop or car body between us and them intercepts.
+        --
+        -- Range check safety: server enforces dist(character.HRP, origin) <
+        -- tool.Range. HRP is at strafe offset (X/Y sliders, typically ~8-20
+        -- studs from target), origin is 3 studs below target head — total
+        -- HRP-to-origin distance stays well under Range (~250) as long as
+        -- the X slider isn't cranked past Range.
         local lead = tHead.AssemblyLinearVelocity * 0.03
+        local origin = tHead.Position - Vector3.new(0, 3, 0)
         local aim = tHead.Position + lead
         local normal = Vector3.new(0, 1, 0)
 
         GunHandler.shoot({
             Shooter = char,
             Handle = handle,
-            ForcedOrigin = muzzlePos,
+            ForcedOrigin = origin,
             AimPosition = aim,
             Hit = tHead,
             Normal = normal,
             Range = range,
             BeamColor = Color3.new(1, 0.2, 0.2),
         })
-        MainEvent:FireServer("ShootGun", handle, muzzlePos, aim, tHead, normal)
+        MainEvent:FireServer("ShootGun", handle, origin, aim, tHead, normal)
         if i < burstSize then task.wait(0.04) end
     end
 
