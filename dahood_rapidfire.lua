@@ -1617,9 +1617,9 @@ strafeBox:AddSlider("RagebotStrafeX", {
     Text = "X Distance",
     Default = 8,
     Min = 3,
-    Max = 40,
+    Max = 20,
     Rounding = 1,
-    Tooltip = "Horizontal distance from target. Server's ShootGun range check needs us under tool.Range studs (~250).",
+    Tooltip = "Horizontal distance from target. Capped at 20: past ~20 studs the server-side raycast from origin (target.Head - 3) back to our HRP starts catching walls/props and the shot fails.",
 })
 
 strafeBox:AddSlider("RagebotStrafeY", {
