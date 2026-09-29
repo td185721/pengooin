@@ -1275,6 +1275,64 @@ end
 -- capture in the closures below.
 local fpReseedInline
 
+-- Spoofed-origin fire path — the whole point of fake pos as a kill vector.
+-- Confirmed live 2026-09-29: DH's server-side ShootGun handler does NOT
+-- range-check the packet's origin field against the shooter's cached HRP
+-- position. Fired ShootGun with origin=(target head - 3 studs) from Y=21,
+-- HRP 335 studs from target, damage landed cleanly. Server applies damage
+-- based on the `hit` param (target's Head instance), and its own range
+-- math uses (origin, hit.Position) which we set adjacent → passes.
+--
+-- Result: dj stays parked at Y=8_000_000 forever, HRP never teleports,
+-- fireBypass window never opens, and other clients never see us at strafe
+-- because there IS no strafe — no physics packet with a strafe pos ever
+-- leaves our client.
+local function fireOneGunSpoofed(tool, target, char)
+    local handle = tool:FindFirstChild("Handle")
+    local ammoObj = tool:FindFirstChild("Ammo")
+    if not handle or not ammoObj then return end
+    if ammoObj.Value <= 0 then
+        MainEvent:FireServer("Reload", tool)
+        return
+    end
+    local tHead = targetHead(target)
+    if not tHead then return end
+
+    local range = (tool:FindFirstChild("Range") and tool.Range.Value) or 200
+    local remote = tool:FindFirstChild("RemoteEvent")
+    if remote then remote:FireServer("Shoot") end
+
+    local burstSize = tool:FindFirstChild("GunClientBurst") and math.min(ammoObj.Value, 3) or 1
+    for i = 1, burstSize do
+        if ammoObj.Value <= 0 or tool.Parent ~= char then break end
+        local currentHead = targetHead(target)
+        if not currentHead then break end
+
+        -- Spoof origin ~3 studs below target's head — well inside any weapon-
+        -- range check server does between origin and hit. HRP never moves.
+        local origin = currentHead.Position - Vector3.new(0, 3, 0)
+        local lead = currentHead.AssemblyLinearVelocity * 0.03
+        local aim = currentHead.Position + lead
+
+        -- Still route through GunHandler.shoot so client-side animations /
+        -- effect hooks fire normally (silent-aim override respects this too).
+        local a, b, c = GunHandler.shoot({
+            Shooter = char,
+            Handle = handle,
+            ForcedOrigin = origin,
+            AimPosition = aim,
+            Range = math.max(range, 500),
+            BeamColor = Color3.new(1, 0.2, 0.2),
+        })
+        -- Force the hit reference to target's head — server damages whoever
+        -- is under hit.Parent's Humanoid, regardless of the client raycast.
+        MainEvent:FireServer("ShootGun", handle, origin, a, currentHead, c or Vector3.new(0, 1, 0))
+        if i < burstSize then task.wait(0.04) end
+    end
+
+    if remote then remote:FireServer() end
+end
+
 local function rbStrafeShoot(target)
     if not selfAlive() then return end
     local char = lp.Character
@@ -1285,6 +1343,17 @@ local function rbStrafeShoot(target)
     if #guns == 0 then return end
 
     ensureGunsEquipped(guns, char)
+
+    -- Under fake pos: fire with spoofed origin from wherever we are (Y=8M).
+    -- No HRP teleport, no fireBypass, no physics packet with strafe pos
+    -- ever leaves the client → target sees nothing.
+    if state.fakePos.active then
+        for _, tool in guns do
+            if not state.ragebot.active then break end
+            fireOneGunSpoofed(tool, target, char)
+        end
+        return
+    end
 
     local tHRP = targetHRP(target)
     if not tHRP then return end
