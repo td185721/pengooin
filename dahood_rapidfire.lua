@@ -997,6 +997,28 @@ local function targetHead(p)
     return p and p.Character and p.Character:FindFirstChild("Head")
 end
 
+-- Auto prediction lookahead: full network round-trip plus one shot cycle
+-- (~50ms of 3-heartbeat settle before FireServer even leaves the client).
+-- GetNetworkPing returns half-RTT in seconds, so double it. Clamped so a
+-- stationary ping spike or a lag glitch doesn't launch us miles ahead.
+local function predictionTime()
+    local ok, half_rtt = pcall(function() return lp:GetNetworkPing() end)
+    local ping = ok and half_rtt or 0.05
+    return math.clamp(2 * ping + 0.05, 0.05, 0.35)
+end
+
+-- Extrapolate a BasePart's position by (velocity * predictionTime). Falls
+-- back to current position if the part or its velocity is gone. Used for
+-- lead against fast-moving targets — flyers, sliding characters, exploiters
+-- rocketing across the map — so the strafe teleport lands where they WILL
+-- be when the ShootGun packet reaches the server, not where they were.
+local function predictedPosOf(part)
+    if not part then return nil end
+    local v = part.AssemblyLinearVelocity
+    if not v then return part.Position end
+    return part.Position + v * predictionTime()
+end
+
 -- Local player alive + fully-loaded check. Used by ragebot to skip fire cycles
 -- while dead / mid-respawn so we don't crash on destroyed parts or fire from
 -- a corpse. Bounded wait: up to `frames` heartbeats for the humanoid to come
@@ -1294,21 +1316,21 @@ local function fireOneGun(tool, target, char)
         local tHead = targetHead(target)
         if not tHead then break end
 
-        -- Origin sits 3 studs below the target's head, NOT at handle.Position.
-        -- Two reasons: (1) under-floor shots — handle is under the floor with
-        -- our body, so a server-side raycast from handle toward target.Head
-        -- crosses the floor and hits it first; (2) even above-floor, this
-        -- guarantees a clear line-of-sight ray from origin to head so no
-        -- prop or car body between us and them intercepts.
+        -- Origin sits 3 studs below the target's PREDICTED head, not at
+        -- handle.Position. Two reasons: (1) under-floor shots — handle is
+        -- under the floor with our body, so a server-side raycast from
+        -- handle toward target.Head crosses the floor and hits it first;
+        -- (2) predicted head means the origin sits where the target WILL
+        -- be by the time the packet lands on the server (~one round-trip
+        -- later), so fast movers can't outrun the shot.
         --
         -- Range check safety: server enforces dist(character.HRP, origin) <
-        -- tool.Range. HRP is at strafe offset (X/Y sliders, typically ~8-20
-        -- studs from target), origin is 3 studs below target head — total
-        -- HRP-to-origin distance stays well under Range (~250) as long as
-        -- the X slider isn't cranked past Range.
-        local lead = tHead.AssemblyLinearVelocity * 0.03
-        local origin = tHead.Position - Vector3.new(0, 3, 0)
-        local aim = tHead.Position + lead
+        -- tool.Range. HRP is placed at (predicted anchor + strafe offset)
+        -- in rbStrafeShoot, so HRP is right next to the predicted head —
+        -- HRP-to-origin distance stays under ~25 studs, well under Range=250.
+        local predHeadPos = predictedPosOf(tHead)
+        local origin = predHeadPos - Vector3.new(0, 3, 0)
+        local aim = predHeadPos
         local normal = Vector3.new(0, 1, 0)
 
         GunHandler.shoot({
@@ -1336,21 +1358,23 @@ local fpReseedInline
 -- Hold at the last-picked strafe position with small per-frame jitter.
 -- Used between shots when a target is present so we stay at the strafe
 -- offset (respecting Y — negative Y keeps us under the floor) instead of
--- being yanked up to the void park.
+-- being yanked up to the void park. Anchor is the target's PREDICTED HRP
+-- position so we track flyers/fast-movers instead of trailing behind.
 local function rbStrafeHold(target, frames)
     for _ = 1, frames do
         if not state.ragebot.active then break end
         local hrp = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
         local tHRP = targetHRP(target)
         if hrp and hrp.Parent and tHRP then
-            local pos = tHRP.Position + strafeOffsetAt(state.ragebot.strafeAngle or 0)
+            local predAnchor = predictedPosOf(tHRP)
+            local pos = predAnchor + strafeOffsetAt(state.ragebot.strafeAngle or 0)
             -- micro-jitter under 1 stud so anti-cheat doesn't see a frozen point
             pos = pos + Vector3.new(
                 (math.random() - 0.5) * 0.6,
                 (math.random() - 0.5) * 0.3,
                 (math.random() - 0.5) * 0.6
             )
-            hrp.CFrame = CFrame.new(pos, tHRP.Position)
+            hrp.CFrame = CFrame.new(pos, predAnchor)
             hrp.AssemblyLinearVelocity = Vector3.zero
         end
         RunService.Heartbeat:Wait()
@@ -1374,22 +1398,28 @@ local function rbStrafeShoot(target)
     -- Pick next strafe angle, snapshot the offset ONCE (random mode picks
     -- a fresh 3D position per call, so freezing it here keeps the HRP stable
     -- through the 3-heartbeat settle and the fire itself), teleport facing
-    -- the target so the gun aims cleanly.
+    -- the target's PREDICTED position so a fast-moving target (flyer,
+    -- exploiter dashing across the map) doesn't leave the strafe pos before
+    -- the shot lands.
     local angle = nextStrafeAngle()
     local offset = strafeOffsetAt(angle)
 
-    hrp.CFrame = CFrame.new(tHRP.Position + offset, tHRP.Position)
+    local predAnchor = predictedPosOf(tHRP)
+    hrp.CFrame = CFrame.new(predAnchor + offset, predAnchor)
     hrp.AssemblyLinearVelocity = Vector3.zero
 
     -- 3 heartbeats (~50ms) so the position replicates to the server before
-    -- its ShootGun range check runs. Rewrite each frame so gravity/humanoid
-    -- physics can't drift us off — critical when Y is negative (under-floor
-    -- collisions and Falling state both try to push us back up).
+    -- its ShootGun range check runs. Rewrite each frame with a FRESH
+    -- prediction so if the target changes velocity mid-settle we track
+    -- them. Also stops gravity/humanoid physics from drifting us off —
+    -- critical when Y is negative (under-floor collisions and Falling
+    -- state both try to push us back up).
     for _ = 1, 3 do
         if not state.ragebot.active then return end
         local currentTHRP = targetHRP(target)
         if currentTHRP then
-            hrp.CFrame = CFrame.new(currentTHRP.Position + offset, currentTHRP.Position)
+            local livePred = predictedPosOf(currentTHRP)
+            hrp.CFrame = CFrame.new(livePred + offset, livePred)
             hrp.AssemblyLinearVelocity = Vector3.zero
         end
         RunService.Heartbeat:Wait()
