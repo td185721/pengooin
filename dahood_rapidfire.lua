@@ -1298,39 +1298,25 @@ local function fireOneGunSpoofed(tool, target, char)
     local tHead = targetHead(target)
     if not tHead then return end
 
-    local range = (tool:FindFirstChild("Range") and tool.Range.Value) or 200
-    local remote = tool:FindFirstChild("RemoteEvent")
-    if remote then remote:FireServer("Shoot") end
-
+    -- Skip GunHandler.shoot entirely — its client-side raycast starts inside
+    -- the target head (origin 3 studs below head, aim at head) and often
+    -- returns a nil hit which the ragebot wrapper on GunHandler.shoot
+    -- would override to something inconsistent. Fire ShootGun with the
+    -- values we KNOW the server accepts (verified live 2026-09-29).
     local burstSize = tool:FindFirstChild("GunClientBurst") and math.min(ammoObj.Value, 3) or 1
     for i = 1, burstSize do
         if ammoObj.Value <= 0 or tool.Parent ~= char then break end
         local currentHead = targetHead(target)
         if not currentHead then break end
 
-        -- Spoof origin ~3 studs below target's head — well inside any weapon-
-        -- range check server does between origin and hit. HRP never moves.
         local origin = currentHead.Position - Vector3.new(0, 3, 0)
         local lead = currentHead.AssemblyLinearVelocity * 0.03
         local aim = currentHead.Position + lead
+        local normal = Vector3.new(0, 1, 0)
 
-        -- Still route through GunHandler.shoot so client-side animations /
-        -- effect hooks fire normally (silent-aim override respects this too).
-        local a, b, c = GunHandler.shoot({
-            Shooter = char,
-            Handle = handle,
-            ForcedOrigin = origin,
-            AimPosition = aim,
-            Range = math.max(range, 500),
-            BeamColor = Color3.new(1, 0.2, 0.2),
-        })
-        -- Force the hit reference to target's head — server damages whoever
-        -- is under hit.Parent's Humanoid, regardless of the client raycast.
-        MainEvent:FireServer("ShootGun", handle, origin, a, currentHead, c or Vector3.new(0, 1, 0))
+        MainEvent:FireServer("ShootGun", handle, origin, aim, currentHead, normal)
         if i < burstSize then task.wait(0.04) end
     end
-
-    if remote then remote:FireServer() end
 end
 
 local function rbStrafeShoot(target)
