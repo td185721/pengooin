@@ -54,6 +54,8 @@ local state = {
         renderBind = nil,
         clone = nil,
         targetIdx = 1,                                        -- rotation index into RagebotTargets multi-select
+        orbitAngle = 0,                                       -- continuous orbit angle around current target (radians)
+        orbitLastTick = 0,                                    -- tick() of last orbit advance — used for dt-based angular velocity
     },
     autoArmor = {
         active = false,
@@ -68,7 +70,7 @@ local state = {
         active = false,
         hook = nil,
         snapshot = nil,                                          -- captured 161 payload (array of bytes) — replayed on every outgoing 161 so server sees us frozen at safe pos while local HRP walks freely
-        fireBypass = false,                                      -- true = pass packets unmodified so ragebot shots register
+        fireBypass = false,                                      -- true = pass 161 packets unmodified (used by the Buy Armor snapshot-swap round trip)
         charConn = nil,
         vizAnchor = nil,                                         -- invisible workspace Part at fake pos
         vizBillboard = nil,                                      -- BillboardGui in our PlayerGui adornee'd to vizAnchor
@@ -883,15 +885,37 @@ local function randomParkPos(target)
     )
 end
 
--- rotating strafe angle: golden-angle step gives good coverage without repeats
-local STRAFE_STEP = math.rad(137.508)
-local function nextStrafeAngle()
-    state.ragebot.strafeAngle = (state.ragebot.strafeAngle or math.random() * math.pi * 2) + STRAFE_STEP
-    return state.ragebot.strafeAngle + (math.random() - 0.5) * 0.4
+-- Orbit config accessors — defaults kick in before the GUI sliders are built
+-- (also protects against Options.* being nil during startup).
+local function orbitRadius()
+    return (Options.RagebotOrbitRadius and Options.RagebotOrbitRadius.Value) or 8
+end
+local function orbitHeight()
+    return (Options.RagebotOrbitHeight and Options.RagebotOrbitHeight.Value) or 0
+end
+local function orbitSpeed()
+    return (Options.RagebotOrbitSpeed and Options.RagebotOrbitSpeed.Value) or 3
 end
 
-local function strafeOffsetAt(angle, distance)
-    return Vector3.new(math.cos(angle) * distance, math.random(-1, 2), math.sin(angle) * distance)
+-- Advance state.ragebot.orbitAngle by (speed * dt). Returns the new angle.
+-- Time-based (not per-frame constant) so orbit speed is framerate-independent.
+local function advanceOrbitAngle()
+    local now = tick()
+    local last = state.ragebot.orbitLastTick
+    local dt = (last > 0) and math.min(now - last, 0.1) or 0
+    state.ragebot.orbitLastTick = now
+    state.ragebot.orbitAngle = (state.ragebot.orbitAngle or 0) + orbitSpeed() * dt
+    return state.ragebot.orbitAngle
+end
+
+-- Build the world-space orbit position for `target` at the given angle.
+-- Height is a straight Y offset from the target's HRP — negative sinks us
+-- under the floor for stealth. Returns nil if the target's HRP is gone.
+local function orbitPosAt(target, angle)
+    local tHRP = targetHRP(target)
+    if not tHRP then return nil end
+    local r = orbitRadius()
+    return tHRP.Position + Vector3.new(math.cos(angle) * r, orbitHeight(), math.sin(angle) * r)
 end
 
 -- Multi-target rotation. Options.RagebotTargets is a Multi dropdown whose
@@ -1124,11 +1148,7 @@ end
 
 -- Park: pick a plausible spot, teleport there with a randomized facing so
 -- our HRP rotation isn't identical every cycle (another cheap tell).
--- Under fake pos snapshot mode this is a no-op — the replay hook keeps
--- server at Y=1M regardless of local HRP, so parking local body serves
--- nothing except yanking dj visibly.
 local function rbParkVoid()
-    if state.fakePos.active then return end
     local hrp = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
     if not hrp then return end
     local pos = randomParkPos(getTargetPlayer())
@@ -1143,17 +1163,7 @@ end
 -- always re-parks the moment we detect we've slid outside the plausible-Y
 -- band (which would happen if physics started applying — e.g. gravity while
 -- at a rooftop-tier Y).
--- Under fake pos snapshot mode this collapses to a plain heartbeat wait: the
--- replay hook already tells server we're at Y=1M, so parking local HRP in
--- void just yanks dj's body around for nothing. Server sees safe pos regardless.
 local function rbHoldVoid(frames)
-    if state.fakePos.active then
-        for _ = 1, frames do
-            if not state.ragebot.active then break end
-            RunService.Heartbeat:Wait()
-        end
-        return
-    end
     local reparkCountdown = math.random(30, 45)
     for i = 1, frames do
         if not state.ragebot.active then break end
@@ -1270,52 +1280,29 @@ local function fireOneGun(tool, target, char)
     if remote then remote:FireServer() end
 end
 
--- Forward decl — fpReseedInline is defined much later (in the Fake Position
--- section). Ragebot fire wraps call it, so we declare the local up here for
--- capture in the closures below.
+-- Forward decl — fpReseedInline is defined in the Fake Position section
+-- and used by the Buy Armor path. Ragebot no longer touches it: kept as a
+-- forward local so the Fake Position section can assign into it.
 local fpReseedInline
 
--- Spoofed-origin fire path — the whole point of fake pos as a kill vector.
--- Confirmed live 2026-09-29: DH's server-side ShootGun handler does NOT
--- range-check the packet's origin field against the shooter's cached HRP
--- position. Fired ShootGun with origin=(target head - 3 studs) from Y=21,
--- HRP 335 studs from target, damage landed cleanly. Server applies damage
--- based on the `hit` param (target's Head instance), and its own range
--- math uses (origin, hit.Position) which we set adjacent → passes.
---
--- Result: dj stays parked at Y=8_000_000 forever, HRP never teleports,
--- fireBypass window never opens, and other clients never see us at strafe
--- because there IS no strafe — no physics packet with a strafe pos ever
--- leaves our client.
-local function fireOneGunSpoofed(tool, target, char)
-    local handle = tool:FindFirstChild("Handle")
-    local ammoObj = tool:FindFirstChild("Ammo")
-    if not handle or not ammoObj then return end
-    if ammoObj.Value <= 0 then
-        MainEvent:FireServer("Reload", tool)
-        return
-    end
-    local tHead = targetHead(target)
-    if not tHead then return end
-
-    -- Skip GunHandler.shoot entirely — its client-side raycast starts inside
-    -- the target head (origin 3 studs below head, aim at head) and often
-    -- returns a nil hit which the ragebot wrapper on GunHandler.shoot
-    -- would override to something inconsistent. Fire ShootGun with the
-    -- values we KNOW the server accepts (verified live 2026-09-29).
-    local burstSize = tool:FindFirstChild("GunClientBurst") and math.min(ammoObj.Value, 3) or 1
-    for i = 1, burstSize do
-        if ammoObj.Value <= 0 or tool.Parent ~= char then break end
-        local currentHead = targetHead(target)
-        if not currentHead then break end
-
-        local origin = currentHead.Position - Vector3.new(0, 3, 0)
-        local lead = currentHead.AssemblyLinearVelocity * 0.03
-        local aim = currentHead.Position + lead
-        local normal = Vector3.new(0, 1, 0)
-
-        MainEvent:FireServer("ShootGun", handle, origin, aim, currentHead, normal)
-        if i < burstSize then task.wait(0.04) end
+-- Orbit-hold: keep the character on the orbit path for `frames` heartbeats,
+-- advancing the angle by (speed * dt) each frame and facing the target so the
+-- gun aims cleanly. Used between fire cycles when a target is present — the
+-- character is continuously moving on the orbit instead of teleport-parking.
+local function rbOrbitHold(target, frames)
+    for _ = 1, frames do
+        if not state.ragebot.active then break end
+        local hrp = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
+        local tHRP = targetHRP(target)
+        if hrp and hrp.Parent and tHRP then
+            local angle = advanceOrbitAngle()
+            local pos = orbitPosAt(target, angle)
+            if pos then
+                hrp.CFrame = CFrame.new(pos, tHRP.Position)
+                hrp.AssemblyLinearVelocity = Vector3.zero
+            end
+        end
+        RunService.Heartbeat:Wait()
     end
 end
 
@@ -1330,76 +1317,28 @@ local function rbStrafeShoot(target)
 
     ensureGunsEquipped(guns, char)
 
-    -- Under fake pos: fire with spoofed origin from wherever we are (Y=8M).
-    -- No HRP teleport, no fireBypass, no physics packet with strafe pos
-    -- ever leaves the client → target sees nothing.
-    if state.fakePos.active then
-        for _, tool in guns do
-            if not state.ragebot.active then break end
-            fireOneGunSpoofed(tool, target, char)
-        end
-        return
-    end
-
     local tHRP = targetHRP(target)
     if not tHRP then return end
 
-    -- rotating strafe angle around target
-    local angle = nextStrafeAngle()
-    local dist = 6 + math.random() * 8
-    local strafePos = tHRP.Position + strafeOffsetAt(angle, dist)
-
-    -- Under fake pos: save dj's current position (Y=1M) so we can snap them
-    -- back local after the fire cycle. Otherwise HRP stays at strafePos after
-    -- the fire, dj is stranded at ground level instead of the fake-pos anchor.
-    local origCF = state.fakePos.active and hrp.CFrame or nil
-
-    -- Bypass fake-position rewrite for the strafe→fire→park round trip so
-    -- real physics packets carry our actual strafe HRP position (server's
-    -- origin check needs to see us near the target for the shot to register).
-    state.fakePos.fireBypass = true
-
-    hrp.CFrame = CFrame.new(strafePos, tHRP.Position)
-    hrp.AssemblyLinearVelocity = Vector3.zero
-
-    -- physics replication is ~30Hz — 2 heartbeats (~33ms) is enough for
-    -- server to accept a Shoot RPC with matching origin under snapshot mode
-    -- (was 3 under Block mode). Every ms shaved here is one ms less that
-    -- enemies see us at the strafe position.
-    local waitFrames = state.fakePos.active and 2 or 3
-    for _ = 1, waitFrames do
-        if not state.ragebot.active then state.fakePos.fireBypass = false; return end
+    -- Advance orbit + place HRP at the current orbit position, facing target.
+    -- Do this 3 heartbeats in a row so the position is stable long enough for
+    -- the server to accept it before the ShootGun range check runs.
+    for _ = 1, 3 do
+        if not state.ragebot.active then return end
+        local angle = advanceOrbitAngle()
+        local pos = orbitPosAt(target, angle)
+        local currentTHRP = targetHRP(target)
+        if pos and currentTHRP then
+            hrp.CFrame = CFrame.new(pos, currentTHRP.Position)
+            hrp.AssemblyLinearVelocity = Vector3.zero
+        end
         RunService.Heartbeat:Wait()
     end
-    hrp.CFrame = CFrame.new(strafePos, tHRP.Position)
-    hrp.AssemblyLinearVelocity = Vector3.zero
 
     for _, tool in guns do
         if not state.ragebot.active then break end
         fireOneGun(tool, target, char)
     end
-
-    -- Skip rbParkVoid under snapshot mode: releasing fireBypass triggers the
-    -- replay hook to overlay safe-pos snapshot on the next 161, so server
-    -- cache snaps straight to Y=1M without needing a local void teleport.
-    -- Under Block mode the void park is still required (cache stays where
-    -- HRP is when Block re-engages).
-    if not state.fakePos.active then
-        RunService.Heartbeat:Wait()
-        rbParkVoid()
-    end
-
-    -- Under fake pos, restore local HRP to dj's pre-fire position (Y=1M) so
-    -- they don't stay stranded at strafePos between fires. Do this BEFORE
-    -- fpReseedInline so the reseed nudge fires from the safe pos.
-    if origCF and hrp.Parent then
-        hrp.CFrame = origCF
-        hrp.AssemblyLinearVelocity = Vector3.zero
-    end
-
-    -- Snap server cache back to safe pos via replay nudge, then release bypass.
-    fpReseedInline()
-    state.fakePos.fireBypass = false
 end
 
 -- ragdoll can leave HRP floating at the old alive position while the visible
@@ -1420,146 +1359,6 @@ local function findRagdollBody(tChar)
     return best
 end
 
--- ── Detached Handle mode ──────────────────────────────────────────────────
--- Alternate ragebot fire path. Per shot: briefly offset the gun's Handle to
--- the target's position via Motor6D.C0, fire with ForcedOrigin = Muzzle
--- (which now sits at target), restore the C0 immediately. Handle spends
--- ~50ms per shot at the target and the rest of the time in the shooter's
--- hand — manual fire outside a ragebot burst is unaffected.
---
--- Anti-cheat audit 2026-09-28:
---   • CHECKER_4 hooks Tool.Grip writes only. Motor6D.C0 is NOT watched.
---   • CHECKER_1 hooks BodyMover additions only. Motor6D unrelated.
---   • No client-side listener on Handle.Position/CFrame or Motor6D property
---     signals; grepped for :GetPropertyChangedSignal("C0"/"C1"/"Part0"/"Part1"
---     with zero hits in Da Hood client code.
---   • Server-side dist(Shooter.HRP, ForcedOrigin) tolerance is unknown. If
---     kills stop registering, the DetachedOffsetY slider is the tuning knob
---     (0 = Handle exactly at target head; positive = above; negative = below).
-
-local function findGripMotor(char, tool)
-    if not char or not tool then return nil end
-    local handle = tool:FindFirstChild("Handle")
-    if not handle then return nil end
-    for _, name in {"RightHand", "LeftHand"} do
-        local h = char:FindFirstChild(name)
-        if h then
-            for _, c in h:GetChildren() do
-                if c:IsA("Motor6D") and c.Part1 == handle then return c end
-            end
-        end
-    end
-    return nil
-end
-
--- Places tool.Handle at worldCF via a Motor6D.C0 write. Returns a restore
--- closure that puts the original C0 (and Transform) back so the gun snaps
--- back into the shooter's hand.
-local function detachHandleFor(char, tool, worldCF)
-    local m = findGripMotor(char, tool)
-    if not m or not m.Part0 then return function() end end
-    local origC0 = m.C0
-    local origTransform = m.Transform
-    pcall(function()
-        m.Transform = CFrame.identity
-        m.C0 = m.Part0.CFrame:ToObjectSpace(worldCF)
-    end)
-    return function()
-        pcall(function()
-            if m.Parent then
-                m.C0 = origC0
-                m.Transform = origTransform
-            end
-        end)
-    end
-end
-
-local function rbDetachedShoot(target)
-    if not selfAlive() then return end
-    local char = lp.Character
-    if not char then return end
-    local guns = collectSelectedGuns()
-    if #guns == 0 then return end
-    ensureGunsEquipped(guns, char)
-
-    local tHead = targetHead(target)
-    if not tHead then return end
-
-    local offsetY = (Options.DetachedOffsetY and Options.DetachedOffsetY.Value) or 0
-    local spinRate = (Options.DetachedSpinRate and Options.DetachedSpinRate.Value) or 5
-
-    -- Save local HRP position so we can restore after fpReseedInline yanks
-    -- us to safeY (fake-pos active case) — Detached mode is supposed to
-    -- leave the character stationary at dj's chosen spot.
-    local hrp = char:FindFirstChild("HumanoidRootPart")
-    local savedHrpCF = hrp and hrp.CFrame
-
-    -- Bypass fake-position rewrite for the duration of this fire cycle so
-    -- the server's origin check sees our real HRP position (not the spoof).
-    state.fakePos.fireBypass = true
-
-    for _, tool in guns do
-        if not state.ragebot.active then break end
-        local handle = tool:FindFirstChild("Handle")
-        if not handle then continue end
-        local ammoObj = tool:FindFirstChild("Ammo")
-        if not ammoObj then continue end
-        if ammoObj.Value <= 0 then
-            MainEvent:FireServer("Reload", tool)
-            continue
-        end
-
-        local spin = tick() * spinRate
-        local worldCF = CFrame.new(tHead.Position + Vector3.new(0, offsetY, 0))
-                        * CFrame.Angles(spin, spin * 0.7, spin * 1.3)
-
-        local restore = detachHandleFor(char, tool, worldCF)
-
-        -- Wait one heartbeat for the offset to replicate to the server before
-        -- reading Muzzle.WorldPosition (which now reflects the offset Handle).
-        RunService.Heartbeat:Wait()
-
-        local def = tool:FindFirstChild("Default")
-        local muzzle = def and def:FindFirstChild("Mesh") and def.Mesh:FindFirstChild("Muzzle")
-        local origin = muzzle and muzzle.WorldPosition or handle.Position
-
-        local range = (tool:FindFirstChild("Range") and tool.Range.Value) or 200
-        local remote = tool:FindFirstChild("RemoteEvent")
-        if remote then remote:FireServer("Shoot") end
-
-        local aim = tHead.Position + tHead.AssemblyLinearVelocity * 0.03
-        local dist = (aim - origin).Magnitude
-
-        local a, b, c = GunHandler.shoot({
-            Shooter = char,
-            Handle = handle,
-            ForcedOrigin = origin,
-            AimPosition = aim,
-            Range = math.max(range, dist + 25),
-            BeamColor = Color3.new(1, 0.2, 0.2),
-        })
-        MainEvent:FireServer("ShootGun", handle, origin, a, b, c)
-        if remote then remote:FireServer() end
-
-        -- Snap Handle back into the hand right after the shot — manual fire
-        -- or a subsequent burst on another gun uses the normal grip.
-        restore()
-    end
-
-    -- Re-seed safe pos so server's cache returns to fake-pos before Block
-    -- re-engages (see fpReseedInline note).
-    fpReseedInline()
-    state.fakePos.fireBypass = false
-
-    -- Restore local character to where dj had them before the fire cycle
-    -- (fpReseedInline teleported to safeY; the teleport-back is blocked by
-    -- our hook now that bypass is off — server keeps thinking we're at safe).
-    if hrp and savedHrpCF and hrp.Parent then
-        hrp.CFrame = savedHrpCF
-        hrp.AssemblyLinearVelocity = Vector3.zero
-    end
-end
-
 local function rbStompCycle(target)
     if not selfAlive() then return end
     local char = lp.Character
@@ -1569,19 +1368,12 @@ local function rbStompCycle(target)
     if not tChar then return end
 
     -- Stay pinned on the body while firing Stomp every frame. Server-side
-    -- stomp handler validates the shooter's HRP position AT RPC-arrival time;
-    -- teleporting away in the same frame as firing gets the stomp rejected
-    -- (server sees us in void, not on the corpse). Keep the pin until either:
+    -- stomp handler validates the shooter's HRP position at RPC-arrival time;
+    -- teleporting away in the same frame as firing gets the stomp rejected.
+    -- Exit conditions:
     --   - targetDowned flips false (Dead / SDeath went true — stomp landed)
-    --   - deadline hits (~2s safety cap, in case something wedges the state)
+    --   - 2s deadline (safety cap in case state wedges)
     --   - ragebot toggle turns off
-    -- The updated targetDowned returns FALSE the moment Dead/SDeath flip, so
-    -- this loop exits immediately after the killing stomp registers.
-    -- Stomp validation reads server-cached HRP; bypass fake-position so the
-    -- real "on-corpse" packet flies during this whole cycle.
-    local origCF = state.fakePos.active and hrp.CFrame or nil
-    state.fakePos.fireBypass = true
-
     local deadline = tick() + 2
     while tick() < deadline and state.ragebot.active and targetDowned(target) do
         local body = findRagdollBody(tChar)
@@ -1592,16 +1384,6 @@ local function rbStompCycle(target)
         pcall(function() MainEvent:FireServer("Stomp") end)
         RunService.Heartbeat:Wait()
     end
-
-    -- Under fake pos: restore local HRP to dj's Y=1M anchor before reseeding.
-    if origCF and hrp.Parent then
-        hrp.CFrame = origCF
-        hrp.AssemblyLinearVelocity = Vector3.zero
-    end
-
-    -- Re-seed safe pos before releasing fire-bypass.
-    fpReseedInline()
-    state.fakePos.fireBypass = false
 end
 
 local function rbUpdateSpectate()
@@ -1621,38 +1403,15 @@ local function rbUpdateSpectate()
     end
 end
 
--- Detached Handle mode removed 2026-09-29 — dj confirmed the concept doesn't
--- work in DH (server-side ShootGun handler validates HRP position, not the
--- weapon Handle's Muzzle position, so offsetting the Handle alone never
--- passed origin check regardless of tuning). Function stub kept so the rbLoop
--- dispatch below doesn't need to be surgery'd; always returns false so every
--- fire routes through rbStrafeShoot.
-local function isDetached()
-    return false
-end
-
--- Wait helper that DOESN'T teleport us — used between shot cycles when in
--- Detached mode. rbHoldVoid always parks the character in void, which is
--- the wrong behavior when we're supposed to be standing at a normal spot.
-local function rbIdleWait(frames)
-    for _ = 1, frames do
-        if not state.ragebot.active then break end
-        RunService.Heartbeat:Wait()
-    end
-end
-
 local function rbLoop()
     if not waitSelfAlive(600) then return end
-    local detachedAtStart = isDetached()
-    if not detachedAtStart then
-        rbHide()
-        rbUpdateSpectate()
-        rbParkVoid()
-        rbHoldVoid(3)
-    else
-        -- Detached mode: character stays wherever it is. No hide, no park.
-        rbUpdateSpectate()
-    end
+    rbHide()
+    rbUpdateSpectate()
+    rbParkVoid()
+    rbHoldVoid(3)
+    -- Reset orbit clock so first advance uses dt=0 (no huge jump if a prior
+    -- session left state.ragebot.orbitLastTick stale).
+    state.ragebot.orbitLastTick = 0
 
     while state.ragebot.active do
         -- Death guard: if we're dead / mid-respawn, wait for humanoid to come
@@ -1665,45 +1424,38 @@ local function rbLoop()
 
         rbUpdateSpectate()
         local target = getTargetPlayer()
-        local detached = isDetached()
 
         if not target or not target.Parent then
             if #getSelectedTargetNames() > 0 then advanceTarget() end
-            if detached then rbIdleWait(6) else rbHoldVoid(6) end
+            rbHoldVoid(6)
+            state.ragebot.orbitLastTick = 0                       -- restart dt clock when we re-acquire
             continue
         end
 
         if not targetAlive(target) then
             advanceTarget()
-            if detached then rbIdleWait(4) else rbHoldVoid(4) end
+            rbHoldVoid(4)
+            state.ragebot.orbitLastTick = 0
             continue
         end
 
         if shouldSkipTarget(target) then
-            if detached then rbIdleWait(6) else rbHoldVoid(6) end
+            rbOrbitHold(target, 6)                                -- orbit while spawn-protection ticks down
             continue
         end
 
         if targetDowned(target) and Toggles.RagebotAutoStomp.Value then
             rbStompCycle(target)
             advanceTarget()
-            if detached then
-                rbIdleWait(4)                                         -- no park in detached mode
-            else
-                rbParkVoid()
-                rbHoldVoid(4)
-            end
+            rbHoldVoid(4)
+            state.ragebot.orbitLastTick = 0
             continue
         end
 
-        if detached then
-            rbDetachedShoot(target)
-        else
-            rbStrafeShoot(target)
-        end
+        rbStrafeShoot(target)
 
         local waitFrames = math.max(1, math.floor(Options.RagebotDelay.Value * 60))
-        if detached then rbIdleWait(waitFrames) else rbHoldVoid(waitFrames) end
+        rbOrbitHold(target, waitFrames)
     end
 end
 
@@ -1820,10 +1572,37 @@ runBox:AddSlider("RagebotDelay", {
     Min = 0.05,
     Max = 1.0,
     Rounding = 2,
-    Tooltip = "Seconds between shot bursts from void",
+    Tooltip = "Seconds between shot bursts",
 })
 
--- Detached Handle groupbox removed 2026-09-29 — see isDetached() note.
+local orbitBox = Tabs.Ragebot:AddRightGroupbox("Orbit")
+
+orbitBox:AddSlider("RagebotOrbitRadius", {
+    Text = "Radius (X)",
+    Default = 8,
+    Min = 3,
+    Max = 40,
+    Rounding = 1,
+    Tooltip = "Horizontal distance from target — server's ShootGun range check needs us under tool.Range studs (~250).",
+})
+
+orbitBox:AddSlider("RagebotOrbitHeight", {
+    Text = "Height (Y)",
+    Default = 0,
+    Min = -30,
+    Max = 30,
+    Rounding = 1,
+    Tooltip = "Vertical offset from target's HRP. Negative sinks us under the floor — invisible to enemies while shots still register.",
+})
+
+orbitBox:AddSlider("RagebotOrbitSpeed", {
+    Text = "Orbit Speed",
+    Default = 3,
+    Min = 0,
+    Max = 8,
+    Rounding = 2,
+    Tooltip = "Angular velocity in radians/sec around the target. 0 = park at current angle, ~6 = fast strafe.",
+})
 
 Toggles.Ragebot:OnChanged(function()
     if Toggles.Ragebot.Value then rbStart() else rbStop() end
@@ -2181,12 +1960,11 @@ end)
 --   check fails, damage rejected. Same math kills melee, stomp, and any
 --   magic-bullet ragebot targeting us.
 --
--- Ragebot compatibility: rbStrafeShoot / rbDetachedShoot / rbStompCycle
--- each toggle state.fakePos.fireBypass around their own fire window, so
--- real physics packets fly during that window (server updates cache to
--- our real strafe/stomp position), the shot's origin check passes, then
--- the spoof re-engages (server updates back to the fake position on the
--- next fire cycle's post-shot bypass=false transition).
+-- Ragebot compatibility: ragebot no longer coordinates with fake pos.
+-- If both are on, ragebot's strafe teleport writes local HRP but the
+-- outgoing 161 gets rewritten by this hook → server still thinks we're
+-- at safe pos → ShootGun's origin check fails and no damage lands.
+-- Running fake pos = godmode only. Turn it off to use ragebot.
 --
 -- Anti-cheat surface: none of Da Hood's CHECKER_* hooks read raknet-layer
 -- data. Block happens after Roblox's engine assembles the packet, before
