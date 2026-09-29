@@ -55,6 +55,7 @@ local state = {
         clone = nil,
         targetIdx = 1,                                        -- rotation index into RagebotTargets multi-select
         strafeAngle = 0,                                      -- current angle around target (radians), advanced per teleport
+        humState = nil,                                       -- saved Humanoid.PlatformStand/AutoRotate for restore on rbShow
     },
     autoArmor = {
         active = false,
@@ -1059,12 +1060,27 @@ local function rbHide()
         type = camera.CameraType,
     }
 
+    -- Kill the humanoid state machine while ragebot drives the character —
+    -- otherwise "Falling" / "Landing" / walk-to-floor impulses fight our
+    -- per-frame CFrame writes, especially when Y is negative and the humanoid
+    -- tries to snap us up out of the floor.
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if hum then
+        state.ragebot.humState = {platformStand = hum.PlatformStand, autoRotate = hum.AutoRotate}
+        hum.PlatformStand = true
+        hum.AutoRotate = false
+    end
+
     local restores = {}
     for _, d in char:GetDescendants() do
         if d:IsA("BasePart") then
-            restores[d] = {kind = "part", trans = d.LocalTransparencyModifier, shadow = d.CastShadow}
+            -- Also disable collisions so under-floor writes don't get pushed
+            -- back up by torso/leg-vs-floor contacts. HRP is already non-collide
+            -- by default but the other rig parts aren't.
+            restores[d] = {kind = "part", trans = d.LocalTransparencyModifier, shadow = d.CastShadow, canCollide = d.CanCollide}
             d.LocalTransparencyModifier = 1
             d.CastShadow = false
+            d.CanCollide = false
         elseif d:IsA("Decal") or d:IsA("Texture") then
             restores[d] = {kind = "decal", val = d.Transparency}
             d.Transparency = 1
@@ -1107,12 +1123,25 @@ local function rbShow()
         pcall(function() RunService:UnbindFromRenderStep(state.ragebot.renderBind) end)
         state.ragebot.renderBind = nil
     end
+    -- Restore humanoid state (PlatformStand + AutoRotate) BEFORE flipping
+    -- collisions back on, so a still-platform-standing humanoid doesn't take
+    -- one physics tick with collisions and get catapulted by the map.
+    if state.ragebot.humState then
+        local hum = lp.Character and lp.Character:FindFirstChildOfClass("Humanoid")
+        if hum then
+            hum.PlatformStand = state.ragebot.humState.platformStand
+            hum.AutoRotate = state.ragebot.humState.autoRotate
+        end
+        state.ragebot.humState = nil
+    end
+
     if state.ragebot.restores then
         for d, r in state.ragebot.restores do
             if d.Parent then
                 if r.kind == "part" then
                     d.LocalTransparencyModifier = r.trans
                     d.CastShadow = r.shadow
+                    if r.canCollide ~= nil then d.CanCollide = r.canCollide end
                 elseif r.kind == "decal" then d.Transparency = r.val
                 elseif r.kind == "gui" then d.Enabled = r.val
                 elseif r.kind == "effect" then d.Enabled = r.val
@@ -1279,6 +1308,30 @@ end
 -- forward local so the Fake Position section can assign into it.
 local fpReseedInline
 
+-- Hold at the last-picked strafe position with small per-frame jitter.
+-- Used between shots when a target is present so we stay at the strafe
+-- offset (respecting Y — negative Y keeps us under the floor) instead of
+-- being yanked up to the void park.
+local function rbStrafeHold(target, frames)
+    for _ = 1, frames do
+        if not state.ragebot.active then break end
+        local hrp = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
+        local tHRP = targetHRP(target)
+        if hrp and hrp.Parent and tHRP then
+            local pos = tHRP.Position + strafeOffsetAt(state.ragebot.strafeAngle or 0)
+            -- micro-jitter under 1 stud so anti-cheat doesn't see a frozen point
+            pos = pos + Vector3.new(
+                (math.random() - 0.5) * 0.6,
+                (math.random() - 0.5) * 0.3,
+                (math.random() - 0.5) * 0.6
+            )
+            hrp.CFrame = CFrame.new(pos, tHRP.Position)
+            hrp.AssemblyLinearVelocity = Vector3.zero
+        end
+        RunService.Heartbeat:Wait()
+    end
+end
+
 local function rbStrafeShoot(target)
     if not selfAlive() then return end
     local char = lp.Character
@@ -1303,20 +1356,23 @@ local function rbStrafeShoot(target)
 
     -- 3 heartbeats (~50ms) so the new position replicates to the server
     -- before its ShootGun range check runs on the outgoing packet.
+    -- Rewrite each frame so gravity/humanoid physics can't drift us off
+    -- (especially critical when Y is negative — under-floor collisions
+    -- and Falling state both try to push us back up).
     for _ = 1, 3 do
         if not state.ragebot.active then return end
+        local currentTHRP = targetHRP(target)
+        if currentTHRP then
+            hrp.CFrame = CFrame.new(currentTHRP.Position + strafeOffsetAt(angle), currentTHRP.Position)
+            hrp.AssemblyLinearVelocity = Vector3.zero
+        end
         RunService.Heartbeat:Wait()
     end
-    hrp.CFrame = CFrame.new(strafePos, tHRP.Position)
-    hrp.AssemblyLinearVelocity = Vector3.zero
 
     for _, tool in guns do
         if not state.ragebot.active then break end
         fireOneGun(tool, target, char)
     end
-
-    RunService.Heartbeat:Wait()
-    rbParkVoid()
 end
 
 -- ragdoll can leave HRP floating at the old alive position while the visible
@@ -1413,14 +1469,13 @@ local function rbLoop()
         end
 
         if shouldSkipTarget(target) then
-            rbHoldVoid(6)
+            rbStrafeHold(target, 6)                               -- hold at strafe pos while spawn protection ticks down
             continue
         end
 
         if targetDowned(target) and Toggles.RagebotAutoStomp.Value then
             rbStompCycle(target)
             advanceTarget()
-            rbParkVoid()
             rbHoldVoid(4)
             continue
         end
@@ -1428,7 +1483,7 @@ local function rbLoop()
         rbStrafeShoot(target)
 
         local waitFrames = math.max(1, math.floor(Options.RagebotDelay.Value * 60))
-        rbHoldVoid(waitFrames)
+        rbStrafeHold(target, waitFrames)
     end
 end
 
