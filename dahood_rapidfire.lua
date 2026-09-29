@@ -1274,8 +1274,8 @@ local function fireOneGun(tool, target, char)
     local burstSize = tool:FindFirstChild("GunClientBurst") and math.min(ammoObj.Value, 3) or 1
     for i = 1, burstSize do
         if ammoObj.Value <= 0 or tool.Parent ~= char then break end
-        local currentTargetHRP = targetHRP(target)
-        if not currentTargetHRP then break end
+        local tHead = targetHead(target)
+        if not tHead then break end
 
         local muzzlePos
         local def = tool:FindFirstChild("Default")
@@ -1285,18 +1285,27 @@ local function fireOneGun(tool, target, char)
             muzzlePos = handle.Position
         end
 
-        local lead = currentTargetHRP.AssemblyLinearVelocity * 0.03
-        local aim = currentTargetHRP.Position + lead
+        -- Force the hit to target.Head. GunHandler.shoot's Hit branch skips
+        -- its raycast when Hit is provided, so an under-floor shot doesn't
+        -- ray into the floor and come back with hit=map-geometry (server
+        -- reads the hit param for damage — if it's a wall, no damage).
+        -- HRP-vs-origin check still needs muzzle near HRP; that's satisfied
+        -- by holding at the strafe offset (X/Y sliders) close to target.
+        local lead = tHead.AssemblyLinearVelocity * 0.03
+        local aim = tHead.Position + lead
+        local normal = Vector3.new(0, 1, 0)
 
-        local a, b, c = GunHandler.shoot({
+        GunHandler.shoot({
             Shooter = char,
             Handle = handle,
             ForcedOrigin = muzzlePos,
             AimPosition = aim,
+            Hit = tHead,
+            Normal = normal,
             Range = range,
             BeamColor = Color3.new(1, 0.2, 0.2),
         })
-        MainEvent:FireServer("ShootGun", handle, muzzlePos, a, b, c)
+        MainEvent:FireServer("ShootGun", handle, muzzlePos, aim, tHead, normal)
         if i < burstSize then task.wait(0.04) end
     end
 
