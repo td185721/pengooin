@@ -1927,6 +1927,12 @@ resetBox:AddToggle("AutoResetReturn", {
     Tooltip = "On respawn, teleport back to the exact HRP CFrame you had at the moment the down was detected.",
 })
 
+resetBox:AddToggle("AntiLockReset", {
+    Text = "Anti-Lock: Reset on Damage (Fake Pos only)",
+    Default = false,
+    Tooltip = "While Fake Pos is active, any drop in Humanoid.Health is treated as a silent-aim / resolver hit and triggers an immediate reset — breaks the attacker's aim-lock. Combined with 'Return to Death Position' + a randomized safe Y, they lose the target between shots. Ignored when Fake Pos is off (normal PvP damage would loop-reset you).",
+})
+
 local function clearResetWatch()
     for _, c in state.autoReset.watchConns do
         pcall(function() c:Disconnect() end)
@@ -2032,6 +2038,23 @@ function watchDownState(char)
     if hum then
         table.insert(state.autoReset.watchConns, hum.Died:Connect(function()
             if state.autoReset.active then doForceReset() end
+        end))
+
+        -- Anti-lock: while fake pos is active, any health drop = external
+        -- silent-aim / resolver hit (legit shooters can't range-check to us
+        -- at Y=1M). Reset immediately to break the attacker's aim-lock.
+        local lastHealth = hum.Health
+        table.insert(state.autoReset.watchConns, hum:GetPropertyChangedSignal("Health"):Connect(function()
+            local h = hum.Health
+            if h < lastHealth
+               and Toggles.AntiLockReset and Toggles.AntiLockReset.Value
+               and state.fakePos.active
+               and state.autoReset.active
+               and not state.autoReset.resetting then
+                -- Ignore drops to 0 (Dead handler already fires) — only care about mid-fight hits
+                if h > 0 then doForceReset() end
+            end
+            lastHealth = h
         end))
     end
 end
@@ -2153,9 +2176,12 @@ local function fpDestroyVisualizer()
     end
 end
 
-local function fpCreateVisualizer(safeY)
+local function fpCreateVisualizer(anchorCF)
     fpDestroyVisualizer()
     if not Toggles.FakePosViz or not Toggles.FakePosViz.Value then return end
+    -- Accept either a CFrame (preferred, includes X/Z randomization) or a
+    -- number (legacy Y-only calls) for backward compatibility.
+    if typeof(anchorCF) == "number" then anchorCF = CFrame.new(0, anchorCF, 0) end
 
     local anchor = Instance.new("Part")
     anchor.Name = "pengooin_desync_anchor"
@@ -2165,7 +2191,7 @@ local function fpCreateVisualizer(safeY)
     anchor.CanTouch = false
     anchor.Transparency = 1                                          -- invisible for all clients (replicates)
     anchor.Size = Vector3.new(1, 1, 1)
-    anchor.CFrame = CFrame.new(0, safeY, 0)
+    anchor.CFrame = anchorCF
     anchor.Parent = workspace
 
     local pg = lp:FindFirstChildOfClass("PlayerGui")
@@ -2256,6 +2282,7 @@ local function stopFakePos()
     end
     state.fakePos.snapshot = nil
     state.fakePos.shopSnapshots = nil
+    state.fakePos.activeCF = nil
     state.fakePos.fireBypass = false
     fpDestroyVisualizer()
 end
@@ -2268,7 +2295,19 @@ local function startFakePos()
         return
     end
 
-    local safeY = (Options.FakePosY and Options.FakePosY.Value) or 1000000
+    local baseY = (Options.FakePosY and Options.FakePosY.Value) or 1000000
+    local safeY = baseY
+    if Toggles.FakePosRandomY and Toggles.FakePosRandomY.Value then
+        -- Random Y in [baseY, baseY*10]. Also jitter X/Z modestly so a resolver
+        -- script that ignores Y but tracks X/Z can't pin us either.
+        safeY = math.random(baseY, baseY * 10)
+    end
+    -- Optional X/Z jitter within a wide range — non-zero coords make our
+    -- snapshot less signature-y for scripts that hash on origin.
+    local sx = (Toggles.FakePosRandomY and Toggles.FakePosRandomY.Value)
+        and (math.random(-5000, 5000)) or 0
+    local sz = (Toggles.FakePosRandomY and Toggles.FakePosRandomY.Value)
+        and (math.random(-5000, 5000)) or 0
     local char = lp.Character
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
     if not hrp then
@@ -2276,7 +2315,10 @@ local function startFakePos()
         return
     end
     local origCF = hrp.CFrame
-    local safeCF = CFrame.new(0, safeY, 0)
+    local safeCF = CFrame.new(sx, safeY, sz)
+    -- Store the ACTIVE seed CFrame so reseed / indicator / respawn paths
+    -- don't re-read the slider defaults (which discard randomization).
+    state.fakePos.activeCF = safeCF
 
     local snapshot = seedFakePos(safeCF, 0.8)
     if not snapshot then
@@ -2315,7 +2357,7 @@ local function startFakePos()
     hrp.CFrame = origCF
     hrp.AssemblyLinearVelocity = Vector3.zero
 
-    fpCreateVisualizer(safeY)
+    fpCreateVisualizer(safeCF)
 
     -- Respawn re-captures the snapshot for the fresh character (new HRP
     -- referent lives in the packet's inner bytes, so the old snapshot's
@@ -2327,10 +2369,13 @@ local function startFakePos()
         local nHrp = newChar:FindFirstChild("HumanoidRootPart")
         if not nHrp then return end
         local nOrig = nHrp.CFrame
-        local nSafeY = (Options.FakePosY and Options.FakePosY.Value) or safeY
-        -- Bypass replay while we re-capture so real packets fly at the seed pos
+        -- Re-seed at the SAME CFrame we snapshotted at (preserves any Y/X/Z
+        -- randomization applied at engage). Fresh character = fresh HRP
+        -- referent → the position bytes in the old snapshot are stale, so
+        -- we grab a new one at the same anchor pos.
+        local anchorCF = state.fakePos.activeCF or CFrame.new(0, (Options.FakePosY and Options.FakePosY.Value) or 1000000, 0)
         state.fakePos.fireBypass = true
-        local snap = seedFakePos(CFrame.new(0, nSafeY, 0), 0.6)
+        local snap = seedFakePos(anchorCF, 0.6)
         if snap then state.fakePos.snapshot = snap end
         state.fakePos.fireBypass = false
         nHrp.CFrame = nOrig
@@ -2352,10 +2397,16 @@ fpBox:AddSlider("FakePosY", {
     Text = "Safe Position Y",
     Default = 1000000,
     Min = 10000,
-    Max = 10000000,
+    Max = 100000000,
     Rounding = 0,
     Suffix = " studs",
-    Tooltip = "How high the fake position sits. Roblox float precision drops past ~16.7M studs (2^24), so going above 10M risks the CFrame quantizing to a wrong value. Any value >500 puts you beyond all Da Hood weapon ranges (max ~250).",
+    Tooltip = "How high the fake position sits. Y=1_000_000 is the standard fake-pos target — other cheaters' resolver scripts explicitly hunt this Y and can hit you there via co-located teleport. Try Y>16_700_000 (past 2^24 float precision boundary) to break their targeting: CFrames quantize weirdly beyond that and some server / anti-cheat code produces NaN. Any value >500 puts you beyond all DH weapon ranges (max ~250).",
+})
+
+fpBox:AddToggle("FakePosRandomY", {
+    Text = "Randomize Y on Engage",
+    Default = false,
+    Tooltip = "When Fake Pos toggles on, roll a random Y in [FakePosY, FakePosY*10]. Attacker scripts that hardcode target Ys (or cache your snapshot across sessions) can't reliably reach you if the Y is different each engage.",
 })
 
 fpBox:AddToggle("FakePosViz", {
@@ -2375,14 +2426,17 @@ fpBox:AddButton({
         local char = lp.Character
         local hrp = char and char:FindFirstChild("HumanoidRootPart")
         if not hrp then Library:Notify("Resync: no character", 3); return end
-        local safeY = (Options.FakePosY and Options.FakePosY.Value) or 1000000
+        -- Snap to the active seed CFrame (includes randomization) so we
+        -- land on the exact spot the server thinks we are, not the slider default.
+        local anchorCF = state.fakePos.activeCF
+            or CFrame.new(0, (Options.FakePosY and Options.FakePosY.Value) or 1000000, 0)
         state.fakePos.fireBypass = true
-        hrp.CFrame = CFrame.new(0, safeY, 0)
+        hrp.CFrame = anchorCF
         hrp.AssemblyLinearVelocity = Vector3.zero
         RunService.Heartbeat:Wait()
         RunService.Heartbeat:Wait()
         state.fakePos.fireBypass = false
-        Library:Notify("Resynced to server position (Y=" .. tostring(safeY) .. ")", 3)
+        Library:Notify(string.format("Resynced to server position (Y=%d)", math.floor(anchorCF.Position.Y)), 3)
     end,
 })
 
@@ -2393,8 +2447,9 @@ end)
 Toggles.FakePosViz:OnChanged(function()
     if not state.fakePos.active then return end
     if Toggles.FakePosViz.Value then
-        local safeY = (Options.FakePosY and Options.FakePosY.Value) or 1000000
-        fpCreateVisualizer(safeY)
+        local anchorCF = state.fakePos.activeCF
+            or CFrame.new(0, (Options.FakePosY and Options.FakePosY.Value) or 1000000, 0)
+        fpCreateVisualizer(anchorCF)
     else
         fpDestroyVisualizer()
     end
@@ -2951,12 +3006,16 @@ local function buildIndicator()
 
         vis.conn = RunService.RenderStepped:Connect(function()
             -- Point the dot at wherever the SERVER thinks we are:
-            --   fake pos active → the snapshot's seed pos (0, safeY, 0)
+            --   fake pos active → the snapshot's seed pos (activeCF, includes any randomization)
             --   fake pos off    → our real character (server cache tracks local HRP naturally)
             local worldPos
             if state.fakePos and state.fakePos.active then
-                local safeY = (Options.FakePosY and Options.FakePosY.Value) or 1000000
-                worldPos = Vector3.new(0, safeY, 0)
+                if state.fakePos.activeCF then
+                    worldPos = state.fakePos.activeCF.Position
+                else
+                    local safeY = (Options.FakePosY and Options.FakePosY.Value) or 1000000
+                    worldPos = Vector3.new(0, safeY, 0)
+                end
             else
                 local c = lp.Character
                 local hd = c and c:FindFirstChild("Head")
