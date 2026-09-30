@@ -1087,6 +1087,35 @@ local function shouldSkipTarget(target)
     return false
 end
 
+-- Force-restore the current local character's visible state regardless of
+-- what state.ragebot.restores holds. Used as belt-and-suspenders in rbShow
+-- because after a respawn during ragebot the restores map keys reference
+-- destroyed parts — iterating it no-ops for the new character. The force
+-- pass here directly resets whatever parts the character has NOW.
+--
+-- Doesn't touch CanCollide (accessories/HRP are intentionally non-collide
+-- by default; restoring blindly would break the rig) or PlatformStand (handled
+-- separately in rbShow).
+local function rbForceRestoreLocal()
+    local char = lp.Character
+    if not char then return end
+    for _, d in char:GetDescendants() do
+        pcall(function()
+            if d:IsA("BasePart") then
+                d.LocalTransparencyModifier = 0
+                d.CastShadow = true
+            elseif d:IsA("Decal") or d:IsA("Texture") then
+                d.Transparency = 0
+            elseif d:IsA("BillboardGui") or d:IsA("SurfaceGui")
+                   or d:IsA("ParticleEmitter") or d:IsA("Beam") or d:IsA("Trail")
+                   or d:IsA("Fire") or d:IsA("Smoke") or d:IsA("Sparkles")
+                   or d:IsA("Light") then
+                d.Enabled = true
+            end
+        end)
+    end
+end
+
 local function rbHide()
     local char = lp.Character
     local hrp = char and char:FindFirstChild("HumanoidRootPart")
@@ -1136,8 +1165,16 @@ local function rbHide()
     end
     state.ragebot.restores = restores
 
-    local bindName = "pengooin_Rage_" .. tostring(tick())
+    -- Track every bind name we ever hand to BindToRenderStep so rbShow can
+    -- kill leaks. Previous code stored only the current bindName; if rbHide
+    -- was ever called twice without an intervening successful rbShow (respawn
+    -- races, script re-execute with prior state, etc.), the older bind was
+    -- orphaned and kept hiding the character forever. Set semantics via a
+    -- keyed table.
+    state.ragebot.allRenderBinds = state.ragebot.allRenderBinds or {}
+    local bindName = "pengooin_Rage_" .. tostring(tick()) .. "_" .. tostring(math.random(1e9))
     state.ragebot.renderBind = bindName
+    state.ragebot.allRenderBinds[bindName] = true
     RunService:BindToRenderStep(bindName, 3000, function()
         for d, r in restores do
             if d.Parent then
@@ -1156,48 +1193,84 @@ local function rbHide()
     state.ragebot.hidden = true
 end
 
+-- Bulletproof restore. Runs regardless of state.ragebot.hidden (the old
+-- guard could get out of sync and prevent restore entirely), pcall-wraps
+-- every step so one failing property write doesn't abort the rest, unbinds
+-- EVERY render bind we ever created (kills leaked hides), and finishes with
+-- a force-restore pass over the current character's parts as a belt-and-
+-- suspenders against stale restore-map entries pointing at destroyed
+-- (post-respawn) parts. Does NOT teleport back to origCF — the old yank
+-- to pre-ragebot pos felt like a "teleport back to last position" bug.
 local function rbShow()
-    if not state.ragebot.hidden then return end
-    if state.ragebot.renderBind then
-        pcall(function() RunService:UnbindFromRenderStep(state.ragebot.renderBind) end)
-        state.ragebot.renderBind = nil
-    end
-    -- Restore humanoid state (PlatformStand + AutoRotate) BEFORE flipping
-    -- collisions back on, so a still-platform-standing humanoid doesn't take
-    -- one physics tick with collisions and get catapulted by the map.
-    if state.ragebot.humState then
-        local hum = lp.Character and lp.Character:FindFirstChildOfClass("Humanoid")
-        if hum then
-            hum.PlatformStand = state.ragebot.humState.platformStand
-            hum.AutoRotate = state.ragebot.humState.autoRotate
+    -- Unbind ALL tracked render binds (past and current) first so no per-
+    -- frame hide loop can undo the restores that follow.
+    if state.ragebot.allRenderBinds then
+        for bn in state.ragebot.allRenderBinds do
+            pcall(function() RunService:UnbindFromRenderStep(bn) end)
         end
-        state.ragebot.humState = nil
+        table.clear(state.ragebot.allRenderBinds)
     end
+    state.ragebot.renderBind = nil
 
+    -- Restore humanoid state. If humState was cleared / never saved (edge
+    -- case: rbHide skipped, character replaced mid-cycle), force sane
+    -- defaults — a lingering PlatformStand=true is exactly what leaves dj
+    -- "floating" after toggle-off.
+    do
+        local char = lp.Character
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        if hum then
+            pcall(function()
+                if state.ragebot.humState then
+                    hum.PlatformStand = state.ragebot.humState.platformStand
+                    hum.AutoRotate = state.ragebot.humState.autoRotate
+                else
+                    hum.PlatformStand = false
+                    hum.AutoRotate = true
+                end
+                -- Also force-eject any Sit weld. Under rbHide we set
+                -- PlatformStand=true but Sit is a separate state; on toggle
+                -- off we want the character walking freely again.
+                if hum.SeatPart or hum.Sit then hum.Sit = false end
+            end)
+        end
+    end
+    state.ragebot.humState = nil
+
+    -- Apply the stored restores map — pcall each write so one destroyed
+    -- part doesn't abort the rest of the map.
     if state.ragebot.restores then
         for d, r in state.ragebot.restores do
             if d.Parent then
-                if r.kind == "part" then
-                    d.LocalTransparencyModifier = r.trans
-                    d.CastShadow = r.shadow
-                    if r.canCollide ~= nil then d.CanCollide = r.canCollide end
-                elseif r.kind == "decal" then d.Transparency = r.val
-                elseif r.kind == "gui" then d.Enabled = r.val
-                elseif r.kind == "effect" then d.Enabled = r.val
-                elseif r.kind == "light" then d.Enabled = r.val
-                end
+                pcall(function()
+                    if r.kind == "part" then
+                        d.LocalTransparencyModifier = r.trans
+                        d.CastShadow = r.shadow
+                        if r.canCollide ~= nil then d.CanCollide = r.canCollide end
+                    elseif r.kind == "decal" then d.Transparency = r.val
+                    elseif r.kind == "gui" then d.Enabled = r.val
+                    elseif r.kind == "effect" then d.Enabled = r.val
+                    elseif r.kind == "light" then d.Enabled = r.val
+                    end
+                end)
             end
         end
         state.ragebot.restores = nil
     end
+
+    -- Force-restore visibility on the CURRENT character. Covers the case
+    -- where restores-map entries were keyed on a destroyed (respawned)
+    -- character so the loop above no-op'd everything.
+    rbForceRestoreLocal()
+
     if state.ragebot.camState then
-        camera.CameraSubject = state.ragebot.camState.subject
-        camera.CameraType = state.ragebot.camState.type
+        pcall(function()
+            camera.CameraSubject = state.ragebot.camState.subject
+            camera.CameraType = state.ragebot.camState.type
+        end)
         state.ragebot.camState = nil
     end
-    local char = lp.Character
-    local hrp = char and char:FindFirstChild("HumanoidRootPart")
-    if hrp and state.ragebot.origCF then hrp.CFrame = state.ragebot.origCF end
+
     state.ragebot.origCF = nil
     state.ragebot.hidden = false
 end
@@ -1622,6 +1695,12 @@ end
 
 local function rbStop()
     state.ragebot.active = false
+    -- Eager rbShow — don't wait for the ragebot thread's outer while loop to
+    -- schedule it. If the thread is stuck (long tick, mid-yield, whatever),
+    -- the character still returns to normal within a frame of toggle-off.
+    -- rbShow is safe to call multiple times (the thread's own final rbShow
+    -- will no-op on the already-cleared state).
+    pcall(rbShow)
 end
 
 -- Ragebot GUI
