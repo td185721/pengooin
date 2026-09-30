@@ -1431,22 +1431,21 @@ local function rbStrafeShoot(target)
     end
 end
 
--- ragdoll can leave HRP floating at the old alive position while the visible
--- body flops elsewhere. pick the lowest major part — that's what's actually
--- on the ground and what the server hitbox for stomp checks against.
+-- Ragdoll pivot pick: walk RAGDOLL_PARTS in priority order and return the
+-- first one that exists. Priority (UpperTorso → LowerTorso → Torso → HRP)
+-- puts the ragdoll's stable center-of-mass first — earlier revisions picked
+-- the lowest-Y matching part, which flipped between LowerTorso / HRP /
+-- UpperTorso as the corpse settled and made HRP jitter around the body
+-- each frame (the "spinning on the stomp" bug). A stable pivot means HRP
+-- writes to the same anchor every frame of the stomp cycle.
 local RAGDOLL_PARTS = {"UpperTorso", "LowerTorso", "Torso", "HumanoidRootPart"}
 local function findRagdollBody(tChar)
     if not tChar then return nil end
-    local best
     for _, name in RAGDOLL_PARTS do
         local p = tChar:FindFirstChild(name)
-        if p and p:IsA("BasePart") then
-            if not best or p.Position.Y < best.Position.Y then
-                best = p
-            end
-        end
+        if p and p:IsA("BasePart") then return p end
     end
-    return best
+    return nil
 end
 
 local function rbStompCycle(target)
@@ -1457,23 +1456,48 @@ local function rbStompCycle(target)
     local tChar = target and target.Character
     if not tChar then return end
 
+    -- Fixed yaw for the whole cycle — HRP faces the same direction every frame
+    -- instead of defaulting to +Z each iteration (visually a stable stance,
+    -- not a spinner). Picked once per stomp so different kills don't all look
+    -- identical.
+    local yaw = math.random() * math.pi * 2
+
     -- Stay pinned on the body while firing Stomp every frame. Server-side
     -- stomp handler validates the shooter's HRP position at RPC-arrival time;
     -- teleporting away in the same frame as firing gets the stomp rejected.
     -- Exit conditions:
     --   - targetDowned flips false (Dead / SDeath went true — stomp landed)
+    --   - target Humanoid.Health <= 0 after at least one stomp — the state
+    --     flags never latched (server bug / kill counted via HP only), no
+    --     point pinning further; without this the loop hits the 2s deadline
+    --     and the outer loop's advanceTarget wraps back to the same corpse
+    --     on single-selection so we'd re-enter and stomp again.
     --   - 2s deadline (safety cap in case state wedges)
     --   - ragebot toggle turns off
+    local firedOnce = false
     local deadline = tick() + 2
     while tick() < deadline and state.ragebot.active and targetDowned(target) do
         local body = findRagdollBody(tChar)
         if not body then break end
 
-        hrp.CFrame = CFrame.new(body.Position + Vector3.new(0, 3.2, 0))
+        if firedOnce then
+            local tHum = tChar:FindFirstChildOfClass("Humanoid")
+            if tHum and tHum.Health <= 0 then break end
+        end
+
+        hrp.CFrame = CFrame.new(body.Position + Vector3.new(0, 3.2, 0)) * CFrame.Angles(0, yaw, 0)
         hrp.AssemblyLinearVelocity = Vector3.zero
         pcall(function() MainEvent:FireServer("Stomp") end)
+        firedOnce = true
         RunService.Heartbeat:Wait()
     end
+
+    -- Mark this Character instance as stomped so the outer loop's re-entry
+    -- (advanceTarget wraps back to the same target when only one is selected)
+    -- skips this corpse instead of pinning us on top of it again. Keyed on
+    -- Character instance so respawn (fresh Character) clears the guard naturally.
+    state.ragebot.stompedChars = state.ragebot.stompedChars or setmetatable({}, {__mode = "k"})
+    state.ragebot.stompedChars[tChar] = true
 end
 
 local function rbUpdateSpectate()
@@ -1530,7 +1554,17 @@ local function rbLoop()
         end
 
         if targetDowned(target) and Toggles.RagebotAutoStomp.Value then
-            rbStompCycle(target)
+            -- Guard against re-entry on the same corpse instance (single-target
+            -- selections wrap advanceTarget → same target next iteration; if
+            -- the target's Dead/SDeath flags never latched we'd pin on the
+            -- body forever). rbStompCycle marks the Character instance as
+            -- done; respawn produces a fresh Character reference and clears
+            -- the guard naturally.
+            local tChar = target.Character
+            local already = state.ragebot.stompedChars and tChar and state.ragebot.stompedChars[tChar]
+            if not already then
+                rbStompCycle(target)
+            end
             advanceTarget()
             rbHoldVoid(4)
             continue
@@ -3355,6 +3389,103 @@ Toggles.ChatSpy:OnChanged(function()
     if Toggles.ChatSpy.Value then spyStart() else spyStop() end
 end)
 
+-- ── Anti-Seat ─────────────────────────────────────────────────────────────
+-- Ragebot's park/strafe teleports sometimes land inside a Seat/VehicleSeat's
+-- touch region; Seat.Touched auto-attaches the humanoid (Sit = true) and pins
+-- the character in a chair mid-fight. Toggle sets Seat.Disabled = true on
+-- every current and future Seat / VehicleSeat in the workspace (blocks the
+-- auto-weld), and ejects via Humanoid.Jump = true (spacebar equivalent, the
+-- natural user action) if we're already sitting when the toggle flips on.
+
+local antiSeat = {
+    active = false,
+    restores = {},                                                    -- [seat] = priorDisabled
+    descAdded = nil,
+    charConn = nil,
+    seatedConn = nil,
+    ejectHum = nil,
+}
+
+local function asIsSeat(inst)
+    return inst and (inst:IsA("Seat") or inst:IsA("VehicleSeat"))
+end
+
+local function asDisableSeat(seat)
+    if antiSeat.restores[seat] ~= nil then return end
+    antiSeat.restores[seat] = seat.Disabled
+    pcall(function() seat.Disabled = true end)
+end
+
+local function asRestoreAll()
+    for seat, prior in antiSeat.restores do
+        if seat and seat.Parent then
+            pcall(function() seat.Disabled = prior end)
+        end
+    end
+    table.clear(antiSeat.restores)
+end
+
+local function asEject(hum)
+    if not hum or not antiSeat.active then return end
+    if hum.SeatPart or hum.Sit then
+        pcall(function() hum.Jump = true end)
+    end
+end
+
+local function asBindSeated(char)
+    if antiSeat.seatedConn then antiSeat.seatedConn:Disconnect(); antiSeat.seatedConn = nil end
+    antiSeat.ejectHum = nil
+    if not char then return end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hum then return end
+    antiSeat.ejectHum = hum
+    asEject(hum)                                                       -- already sitting when toggle came on? break out now
+    antiSeat.seatedConn = hum.Seated:Connect(function(active)
+        if active and antiSeat.active then asEject(hum) end
+    end)
+end
+
+local function stopAntiSeat()
+    antiSeat.active = false
+    if antiSeat.descAdded then antiSeat.descAdded:Disconnect(); antiSeat.descAdded = nil end
+    if antiSeat.charConn then antiSeat.charConn:Disconnect(); antiSeat.charConn = nil end
+    if antiSeat.seatedConn then antiSeat.seatedConn:Disconnect(); antiSeat.seatedConn = nil end
+    antiSeat.ejectHum = nil
+    asRestoreAll()
+end
+
+local function startAntiSeat()
+    stopAntiSeat()
+    antiSeat.active = true
+
+    for _, d in workspace:GetDescendants() do
+        if asIsSeat(d) then asDisableSeat(d) end
+    end
+
+    antiSeat.descAdded = workspace.DescendantAdded:Connect(function(d)
+        if antiSeat.active and asIsSeat(d) then asDisableSeat(d) end
+    end)
+
+    antiSeat.charConn = lp.CharacterAdded:Connect(function(char)
+        char:WaitForChild("Humanoid", 5)
+        if antiSeat.active then asBindSeated(char) end
+    end)
+
+    if lp.Character then asBindSeated(lp.Character) end
+end
+
+local antiSeatBox = Tabs.Misc:AddRightGroupbox("Anti-Seat")
+
+antiSeatBox:AddToggle("AntiSeat", {
+    Text = "Disable All Seats",
+    Default = false,
+    Tooltip = "Sets Seat.Disabled = true on every Seat / VehicleSeat in the workspace (and every one that spawns after), so touching a chair no longer auto-attaches your character. If you're already sitting when the toggle flips on, fires Humanoid.Jump to eject. Kills the ragebot-landing-in-a-chair bug.",
+})
+
+Toggles.AntiSeat:OnChanged(function()
+    if Toggles.AntiSeat.Value then startAntiSeat() else stopAntiSeat() end
+end)
+
 -- ── Settings ──
 
 ThemeManager:SetLibrary(Library)
@@ -3381,6 +3512,7 @@ local function hardCleanup()
     pcall(destroyIndicator)
     pcall(espStop)
     pcall(spyStop)
+    pcall(stopAntiSeat)
     -- Restore GunHandler.shoot so silent-aim / ragebot / bullet-manip wrappers
     -- don't keep firing after unload. Toggles table survives Library:Unload,
     -- so without restoring, the wrapper would still read stale toggle state.
