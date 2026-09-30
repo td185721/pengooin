@@ -1355,24 +1355,55 @@ end
 -- forward local so the Fake Position section can assign into it.
 local fpReseedInline
 
--- Hold at the last-picked strafe position with small per-frame jitter.
--- Used between shots when a target is present so we stay at the strafe
--- offset (respecting Y — negative Y keeps us under the floor) instead of
--- being yanked up to the void park. Anchor is the target's PREDICTED HRP
--- position so we track flyers/fast-movers instead of trailing behind.
+-- Belt-and-suspenders sit-eject. rbHide sets PlatformStand=true but Sit is a
+-- separate humanoid state — a Seat.Touched can still weld us mid-cycle while
+-- PlatformStand is on. The old strafe hold visually "shook next to target
+-- doing weird movement" instead of arcing was Sit welds fighting our per-
+-- frame CFrame writes. Anti-Seat toggle handles the game-wide case; this
+-- guarantees the ragebot loop never sits regardless of that toggle's state.
+local function rbBreakSit(char)
+    if not char then return end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hum then return end
+    if hum.SeatPart or hum.Sit then
+        pcall(function() hum.Sit = false end)
+    end
+end
+
+-- Hold near the target between shots. Two behaviors:
+--   (1) periodic re-strafe — every re_strafe_every frames advance the strafe
+--       angle and reposition. Old build held ONE angle for the whole delay
+--       with 0.6-stud jitter, which at close range (default X=8) read as a
+--       trembling character next to the target rather than a ragebot arcing
+--       around them. Re-hopping every 4 frames gives visible strafing motion
+--       through the delay window.
+--   (2) sub-stud micro-jitter (0.15 stud) — enough to keep anti-cheat from
+--       flagging a frozen point, invisible to the eye.
+-- Anchor is the target's PREDICTED HRP so we track flyers/fast-movers.
 local function rbStrafeHold(target, frames)
+    local restrafeEvery = 4
+    local sinceStrafe = 0
     for _ = 1, frames do
         if not state.ragebot.active then break end
-        local hrp = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
+        local char = lp.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
         local tHRP = targetHRP(target)
         if hrp and hrp.Parent and tHRP then
+            rbBreakSit(char)
+            sinceStrafe = sinceStrafe + 1
+            if sinceStrafe >= restrafeEvery then
+                sinceStrafe = 0
+                -- Half-step advance between shots keeps the arc smooth; the
+                -- full step still runs in rbStrafeShoot per shot cycle.
+                state.ragebot.strafeAngle = (state.ragebot.strafeAngle or math.random() * math.pi * 2)
+                    + strafeStep() * 0.5
+            end
             local predAnchor = predictedPosOf(tHRP)
             local pos = predAnchor + strafeOffsetAt(state.ragebot.strafeAngle or 0)
-            -- micro-jitter under 1 stud so anti-cheat doesn't see a frozen point
             pos = pos + Vector3.new(
-                (math.random() - 0.5) * 0.6,
-                (math.random() - 0.5) * 0.3,
-                (math.random() - 0.5) * 0.6
+                (math.random() - 0.5) * 0.15,
+                (math.random() - 0.5) * 0.1,
+                (math.random() - 0.5) * 0.15
             )
             hrp.CFrame = CFrame.new(pos, predAnchor)
             hrp.AssemblyLinearVelocity = Vector3.zero
@@ -1416,6 +1447,7 @@ local function rbStrafeShoot(target)
     -- state both try to push us back up).
     for _ = 1, 3 do
         if not state.ragebot.active then return end
+        rbBreakSit(char)                                                -- reject any Sit weld before the shot's range check runs
         local currentTHRP = targetHRP(target)
         if currentTHRP then
             local livePred = predictedPosOf(currentTHRP)
@@ -1456,46 +1488,53 @@ local function rbStompCycle(target)
     local tChar = target and target.Character
     if not tChar then return end
 
-    -- Fixed yaw for the whole cycle — HRP faces the same direction every frame
-    -- instead of defaulting to +Z each iteration (visually a stable stance,
-    -- not a spinner). Picked once per stomp so different kills don't all look
-    -- identical.
+    -- Fixed yaw for the whole cycle so HRP holds a stable stance instead of
+    -- defaulting to +Z each frame.
     local yaw = math.random() * math.pi * 2
 
-    -- Stay pinned on the body while firing Stomp every frame. Server-side
-    -- stomp handler validates the shooter's HRP position at RPC-arrival time;
-    -- teleporting away in the same frame as firing gets the stomp rejected.
-    -- Exit conditions:
-    --   - targetDowned flips false (Dead / SDeath went true — stomp landed)
-    --   - target Humanoid.Health <= 0 after at least one stomp — the state
-    --     flags never latched (server bug / kill counted via HP only), no
-    --     point pinning further; without this the loop hits the 2s deadline
-    --     and the outer loop's advanceTarget wraps back to the same corpse
-    --     on single-selection so we'd re-enter and stomp again.
-    --   - 2s deadline (safety cap in case state wedges)
-    --   - ragebot toggle turns off
-    local firedOnce = false
-    local deadline = tick() + 2
-    while tick() < deadline and state.ragebot.active and targetDowned(target) do
-        local body = findRagdollBody(tChar)
-        if not body then break end
+    -- Rate-limited stomp cycle. Old build fired Stomp every heartbeat while
+    -- teleporting HRP to the ragdoll's live position; server rate-limits the
+    -- Stomp RPC so most fires got rejected while HRP chased the corpse's
+    -- physics drift — visually "pinned on top spinning around them" and
+    -- occasionally hanging when the ragdoll parts flickered nil.
+    --
+    -- New pattern:
+    --   1. Snapshot the corpse pivot once per attempt.
+    --   2. Hold HRP anchored at (snapshot + 3.2 up) for STOMP_GAP seconds so
+    --      the position replicates and any physics settles.
+    --   3. Fire Stomp ONCE at the end of the gap.
+    --   4. Repeat up to STOMP_ATTEMPTS times, exit early if Dead/SDeath latch
+    --      or HP<=0 after the first fire.
+    -- Server's stomp handler only needs one landing RPC — spamming was never
+    -- required, just superstition.
+    local STOMP_ATTEMPTS = 5
+    local STOMP_GAP = 0.18
 
-        if firedOnce then
+    for attempt = 1, STOMP_ATTEMPTS do
+        if not state.ragebot.active then break end
+        if not targetDowned(target) then break end                      -- Dead/SDeath flipped — landed, done
+        if attempt > 1 then
             local tHum = tChar:FindFirstChildOfClass("Humanoid")
-            if tHum and tHum.Health <= 0 then break end
+            if tHum and tHum.Health <= 0 then break end                 -- HP-based bail when state flags never latch
         end
 
-        hrp.CFrame = CFrame.new(body.Position + Vector3.new(0, 3.2, 0)) * CFrame.Angles(0, yaw, 0)
-        hrp.AssemblyLinearVelocity = Vector3.zero
+        local body = findRagdollBody(tChar)
+        if not body then break end
+        local anchor = body.Position + Vector3.new(0, 3.2, 0)
+
+        local gapEnd = tick() + STOMP_GAP
+        while tick() < gapEnd and state.ragebot.active do
+            rbBreakSit(char)                                            -- corpses can be seatable, don't let it grab us
+            hrp.CFrame = CFrame.new(anchor) * CFrame.Angles(0, yaw, 0)
+            hrp.AssemblyLinearVelocity = Vector3.zero
+            RunService.Heartbeat:Wait()
+        end
         pcall(function() MainEvent:FireServer("Stomp") end)
-        firedOnce = true
-        RunService.Heartbeat:Wait()
     end
 
-    -- Mark this Character instance as stomped so the outer loop's re-entry
-    -- (advanceTarget wraps back to the same target when only one is selected)
-    -- skips this corpse instead of pinning us on top of it again. Keyed on
-    -- Character instance so respawn (fresh Character) clears the guard naturally.
+    -- Mark stomped so the outer loop's re-entry (advanceTarget wraps to the
+    -- same target on single-selection) skips this corpse. Fresh Character on
+    -- respawn clears the guard naturally.
     state.ragebot.stompedChars = state.ragebot.stompedChars or setmetatable({}, {__mode = "k"})
     state.ragebot.stompedChars[tChar] = true
 end
