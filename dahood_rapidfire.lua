@@ -1370,40 +1370,24 @@ local function rbBreakSit(char)
     end
 end
 
--- Hold near the target between shots. Two behaviors:
---   (1) periodic re-strafe — every re_strafe_every frames advance the strafe
---       angle and reposition. Old build held ONE angle for the whole delay
---       with 0.6-stud jitter, which at close range (default X=8) read as a
---       trembling character next to the target rather than a ragebot arcing
---       around them. Re-hopping every 4 frames gives visible strafing motion
---       through the delay window.
---   (2) sub-stud micro-jitter (0.15 stud) — enough to keep anti-cheat from
---       flagging a frozen point, invisible to the eye.
--- Anchor is the target's PREDICTED HRP so we track flyers/fast-movers.
+-- Hold at the last-picked strafe position with small per-frame jitter.
+-- Used between shots when a target is present so we stay at the strafe
+-- offset (respecting Y — negative Y keeps us under the floor) instead of
+-- being yanked up to the void park. Anchor is the target's PREDICTED HRP
+-- position so we track flyers/fast-movers instead of trailing behind.
 local function rbStrafeHold(target, frames)
-    local restrafeEvery = 4
-    local sinceStrafe = 0
     for _ = 1, frames do
         if not state.ragebot.active then break end
-        local char = lp.Character
-        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        local hrp = lp.Character and lp.Character:FindFirstChild("HumanoidRootPart")
         local tHRP = targetHRP(target)
         if hrp and hrp.Parent and tHRP then
-            rbBreakSit(char)
-            sinceStrafe = sinceStrafe + 1
-            if sinceStrafe >= restrafeEvery then
-                sinceStrafe = 0
-                -- Half-step advance between shots keeps the arc smooth; the
-                -- full step still runs in rbStrafeShoot per shot cycle.
-                state.ragebot.strafeAngle = (state.ragebot.strafeAngle or math.random() * math.pi * 2)
-                    + strafeStep() * 0.5
-            end
             local predAnchor = predictedPosOf(tHRP)
             local pos = predAnchor + strafeOffsetAt(state.ragebot.strafeAngle or 0)
+            -- micro-jitter under 1 stud so anti-cheat doesn't see a frozen point
             pos = pos + Vector3.new(
-                (math.random() - 0.5) * 0.15,
-                (math.random() - 0.5) * 0.1,
-                (math.random() - 0.5) * 0.15
+                (math.random() - 0.5) * 0.6,
+                (math.random() - 0.5) * 0.3,
+                (math.random() - 0.5) * 0.6
             )
             hrp.CFrame = CFrame.new(pos, predAnchor)
             hrp.AssemblyLinearVelocity = Vector3.zero
@@ -1447,7 +1431,6 @@ local function rbStrafeShoot(target)
     -- state both try to push us back up).
     for _ = 1, 3 do
         if not state.ragebot.active then return end
-        rbBreakSit(char)                                                -- reject any Sit weld before the shot's range check runs
         local currentTHRP = targetHRP(target)
         if currentTHRP then
             local livePred = predictedPosOf(currentTHRP)
